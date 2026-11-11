@@ -3,15 +3,33 @@ import subprocess
 import re
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import yt_dlp
 
 app = FastAPI(title="ClipForge Backend")
 
+# Enable CORS so your frontend can communicate freely without blocks
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 COOKIES_PATH = "cookies.txt"
+
+# Define the expected JSON body structure from your frontend
+class ClipRequest(BaseModel):
+    url: str
+    start_time: float = 0.0
+    end_time: float = 60.0
+    output_filename: str = "output_short.mp4"
 
 @app.get("/")
 def health_check():
-    return {"status": "ClipForge Docker Backend is running with Auto-Crop & Fast Blur!"}
+    return {"status": "ClipForge Docker Backend is running with POST JSON support!"}
 
 def detect_crop(input_file: str) -> str:
     """Scans the video slice to automatically detect and strip black pillarbox or letterbox bars."""
@@ -28,8 +46,8 @@ def detect_crop(input_file: str) -> str:
         pass
     return None
 
-@app.get("/generate-auto-clip")
-def generate_auto_clip(url: str, start_time: float, end_time: float, output_filename: str = "output_short.mp4"):
+@app.post("/generate-auto-clip")
+def generate_auto_clip(req: ClipRequest):
     input_file = "downloaded_source.mp4"
     
     ydl_opts = {
@@ -42,11 +60,11 @@ def generate_auto_clip(url: str, start_time: float, end_time: float, output_file
         ydl_opts['cookiefile'] = COOKIES_PATH
 
     try:
-        section_spec = f"*{start_time}-{end_time}"
+        section_spec = f"*{req.start_time}-{req.end_time}"
         ydl_opts['download_sections'] = [section_spec]
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+            ydl.download([req.url])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
 
@@ -81,7 +99,7 @@ def generate_auto_clip(url: str, start_time: float, end_time: float, output_file
         "-crf", "23",
         "-c:a", "aac",
         "-b:a", "128k",
-        output_filename
+        req.output_filename
     ]
 
     try:
@@ -94,7 +112,7 @@ def generate_auto_clip(url: str, start_time: float, end_time: float, output_file
     if os.path.exists(input_file):
         os.remove(input_file)
 
-    if not os.path.exists(output_filename):
+    if not os.path.exists(req.output_filename):
         raise HTTPException(status_code=500, detail="Output file was not generated.")
 
-    return FileResponse(output_filename, media_type="video/mp4", filename=output_filename)
+    return FileResponse(req.output_filename, media_type="video/mp4", filename=req.output_filename)
