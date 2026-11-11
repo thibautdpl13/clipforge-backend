@@ -23,7 +23,7 @@ class ClipRequest(BaseModel):
 def download_and_process_video(video_url: str, output_path: str):
     """
     Downloads the YouTube video using yt-dlp with cookie authentication 
-    and browser headers, then applies the robust vertical crop processing pipeline.
+    and browser headers, then applies the foolproof FFmpeg vertical crop pipeline.
     """
     raw_download_path = "/tmp/raw_download.mp4"
     
@@ -54,12 +54,12 @@ def download_and_process_video(video_url: str, output_path: str):
         if not os.path.exists(raw_download_path):
             raise Exception("yt-dlp failed to generate raw download file.")
 
-        # Step 2: Robust FFmpeg vertical crop command (prevents exit status 234 errors)
+        # Step 2: Bulletproof FFmpeg vertical crop & scale command (avoids exit code 8 syntax errors)
         ffmpeg_command = [
             'ffmpeg', '-y', '-i', raw_download_path,
-            '-vf', "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)':(iw-min(iw,ih*9/16))/2:(ih-min(ih,iw*16/9))/2,scale=1080:1920",
+            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
             '-c:v', 'libx264', '-preset', 'fast',
-            '-c:a', 'copy',
+            '-c:a', 'aac', '-b:a', '128k',
             output_path
         ]
         
