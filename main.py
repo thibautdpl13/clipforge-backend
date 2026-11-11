@@ -9,7 +9,6 @@ import yt_dlp
 
 app = FastAPI(title="ClipForge Backend")
 
-# Enable CORS so your frontend communicates without blocks
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,7 +19,6 @@ app.add_middleware(
 
 COOKIES_PATH = "cookies.txt"
 
-# Expecting JSON body matching your frontend request
 class ClipRequest(BaseModel):
     url: str
     start_time: float = 0.0
@@ -50,10 +48,14 @@ def detect_crop(input_file: str) -> str:
 def generate_auto_clip(req: ClipRequest):
     input_file = "downloaded_source.mp4"
     
+    # Enhanced options to bypass cloud IP bot detection
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': input_file,
         'quiet': True,
+        'nocheckcertificate': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
     
     if os.path.exists(COOKIES_PATH):
@@ -71,10 +73,8 @@ def generate_auto_clip(req: ClipRequest):
     if not os.path.exists(input_file):
         raise HTTPException(status_code=500, detail="Source video slice failed to generate.")
 
-    # 1. Automatically detect and strip black side/top bars (pillarboxes/letterboxes)
     crop_filter = detect_crop(input_file)
 
-    # 2. Build the filter graph: Crop first (if needed), then apply fast downscale blur & centered foreground overlay
     if crop_filter:
         adaptive_layout_filter = (
             f"[0:v]{crop_filter}[cleaned];"
