@@ -1,211 +1,100 @@
-import subprocess
-import json
 import os
-import uuid
+import subprocess
+import re
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
-from urllib.parse import urlparse, parse_qs
+import yt_dlp
 
-app = FastAPI()
+app = FastAPI(title="ClipForge Backend")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+COOKIES_PATH = "cookies.txt"
 
-class VideoURL(BaseModel):
-    url: str
+@app.get("/")
+def health_check():
+    return {"status": "ClipForge Docker Backend is running with Auto-Crop & Fast Blur!"}
 
-def extract_video_id(url: str) -> str:
-    parsed_url = urlparse(url)
-    if parsed_url.hostname in ['youtu.be', 'www.youtu.be']:
-        return parsed_url.path[1:]
-    if parsed_url.hostname in ['youtube.com', 'www.youtube.com']:
-        if parsed_url.path == '/watch':
-            return parse_qs(parsed_url.query).get('v', [None])[0]
-        elif parsed_url.path.startswith(('/embed/', '/v/')):
-            return parsed_url.path.split('/')[2]
+def detect_crop(input_file: str) -> str:
+    """Scans the video slice to automatically detect and strip black pillarbox or letterbox bars."""
+    try:
+        cmd = [
+            "ffmpeg", "-i", input_file, "-vframes", "30",
+            "-vf", "cropdetect=24:16:0", "-f", "null", "-"
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        matches = re.findall(r'crop=(\d+:\d+:\d+:\d+)', result.stderr)
+        if matches:
+            return f"crop={matches[-1]}"
+    except Exception:
+        pass
     return None
 
-def find_smart_clip_range(transcript: list) -> tuple[float, float]:
-    """
-    Scans the entire transcript to find the densest dialogue block, 
-    then dynamically adjusts boundaries to start and end on clean sentence breaks,
-    varying the duration between 35 seconds and up to 2 minutes (120 seconds).
-    """
-    if not transcript or len(transcript) == 0:
-        return (10.0, 45.0)
-        
-    total_duration = transcript[-1]["start"] + transcript[-1].get("duration", 5.0)
-    if total_duration <= 35.0:
-        return (0.0, total_duration)
-
-    best_start_idx = 0
-    best_end_idx = min(len(transcript) - 1, 10)
-    max_score = 0
+@app.get("/generate-auto-clip")
+def generate_auto_clip(url: str, start_time: float, end_time: float, output_filename: str = "output_short.mp4"):
+    input_file = "downloaded_source.mp4"
     
-    min_target_duration = 35.0
-    max_target_duration = 120.0
-
-    for i in range(len(transcript)):
-        start_time = transcript[i]["start"]
-        
-        for j in range(i + 1, len(transcript)):
-            end_time = transcript[j]["start"] + transcript[j].get("duration", 3.0)
-            duration = end_time - start_time
-            
-            if duration < min_target_duration:
-                continue
-            if duration > max_target_duration:
-                break
-                
-            block_words = sum(len(transcript[k]["text"].split()) for k in range(i, j + 1))
-            score = block_words / (duration / 60.0)
-            
-            if score > max_score:
-                max_score = score
-                best_start_idx = i
-                best_end_idx = j
-
-    final_start = transcript[best_start_idx]["start"]
-    if final_start > 0.5:
-        final_start = max(0.0, final_start - 0.5)
-
-    final_end = transcript[best_end_idx]["start"] + transcript[best_end_idx].get("duration", 3.0)
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'outtmpl': input_file,
+        'quiet': True,
+    }
     
-    if (final_end - final_start) > 180.0:
-        final_end = final_start + 180.0
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts['cookiefile'] = COOKIES_PATH
 
-    return (float(final_start), float(final_end))
-
-@app.post("/process-video")
-async def process_video(payload: VideoURL):
-    video_url = payload.url
-    
-    command = [
-        "yt-dlp",
-        "--cookies", "cookies.txt",
-        "--remote-components", "ejs:github",
-        "--dump-json",
-        "--extractor-args", "youtube:player_client=default,web_embedded",
-        "--ignore-no-formats-error",
-        video_url
-    ]
-    
     try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
-        )
+        section_spec = f"*{start_time}-{end_time}"
+        ydl_opts['download_sections'] = [section_spec]
         
-        video_data = json.loads(result.stdout)
-        
-        return {
-            "success": True,
-            "title": video_data.get("title"),
-            "duration": video_data.get("duration"),
-            "thumbnail": video_data.get("thumbnail"),
-            "formats": video_data.get("formats", [])
-        }
-        
-    except subprocess.CalledProcessError as e:
-        error_message = e.stderr.strip() if e.stderr else str(e)
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Video processing failed: {error_message}"
-        )
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
     except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Internal server error: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
 
-@app.post("/generate-auto-clip")
-async def generate_auto_clip(payload: VideoURL):
-    job_id = str(uuid.uuid4())[:8]
-    raw_video = f"raw_{job_id}.mp4"
-    output_clip = f"viral_clip_{job_id}.mp4"
-    
-    video_id = extract_video_id(payload.url)
-    if not video_id:
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL format.")
-    
-    try:
-        try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        except Exception:
-            transcript_list = []
-            
-        start_time, end_time = find_smart_clip_range(transcript_list)
-        
-        time_range = f"*{start_time}-{end_time}"
-        
-        download_cmd = [
-            "yt-dlp",
-            "--cookies", "cookies.txt",
-            "--remote-components", "ejs:github",
-            "--extractor-args", "youtube:player_client=default,web_embedded",
-            "--download-sections", time_range,
-            "--format", "mp4/best",
-            "--output", raw_video,
-            payload.url
-        ]
-        
-        process = subprocess.run(download_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
-        if process.returncode != 0:
-            error_output = process.stderr.strip() if process.stderr else "Unknown yt-dlp error"
-            raise HTTPException(status_code=500, detail=f"yt-dlp download failed: {error_output}")
-        
-        if not os.path.exists(raw_video) or os.path.getsize(raw_video) == 0:
-            raise HTTPException(status_code=500, detail="Downloaded segment file is missing or empty.")
-            
+    if not os.path.exists(input_file):
+        raise HTTPException(status_code=500, detail="Source video slice failed to generate.")
+
+    # 1. Automatically detect and strip black side/top bars (pillarboxes/letterboxes)
+    crop_filter = detect_crop(input_file)
+
+    # 2. Build the filter graph: Crop first (if needed), then apply fast downscale blur & centered foreground overlay
+    if crop_filter:
         adaptive_layout_filter = (
-            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920,boxblur=25:10[bg];"
+            f"[0:v]{crop_filter}[cleaned];"
+            "[cleaned]scale=270:480,boxblur=10:5,scale=1080:1920:flags=neighbor[bg];"
+            "[cleaned]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2"
+        )
+    else:
+        adaptive_layout_filter = (
+            "[0:v]scale=270:480,boxblur=10:5,scale=1080:1920:flags=neighbor[bg];"
             "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2"
         )
-        
-        ffmpeg_crop_cmd = [
-            "ffmpeg", "-i", raw_video,
-            "-filter_complex", adaptive_layout_filter,
-            "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
-            output_clip, "-y"
-        ]
-        ffmpeg_process = subprocess.run(ffmpeg_crop_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
-        if ffmpeg_process.returncode != 0:
-            if os.path.exists(raw_video):
-                os.remove(raw_video)
-            raise HTTPException(status_code=500, detail=f"FFmpeg processing failed: {ffmpeg_process.stderr.strip()}")
-        
-        if os.path.exists(raw_video):
-            os.remove(raw_video)
-            
-        if not os.path.exists(output_clip):
-            raise HTTPException(status_code=500, detail="Failed to render vertical short file.")
-            
-        return FileResponse(
-            output_clip,
-            media_type="video/mp4",
-            filename="viral_short.mp4"
-        )
-        
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
-@app.get("/")
-def read_root():
-    return {"status": "ClipForge Docker Backend is running with Deno runtime!"}
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_file,
+        "-filter_complex", adaptive_layout_filter,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        output_filename
+    ]
+
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        if os.path.exists(input_file):
+            os.remove(input_file)
+        raise HTTPException(status_code=500, detail=f"FFmpeg encoding failed: {e.stderr.decode('utf-8')}")
+
+    if os.path.exists(input_file):
+        os.remove(input_file)
+
+    if not os.path.exists(output_filename):
+        raise HTTPException(status_code=500, detail="Output file was not generated.")
+
+    return FileResponse(output_filename, media_type="video/mp4", filename=output_filename)
