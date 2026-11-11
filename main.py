@@ -48,13 +48,13 @@ def detect_crop(input_file: str) -> str:
 def generate_auto_clip(req: ClipRequest):
     input_file = "downloaded_source.mp4"
     
-    # Updated with the android / tv player client fix from the video
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': input_file,
         'quiet': True,
         'nocheckcertificate': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'tv']}},
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'extractor_args': {'youtube': {'player_client': ['web', 'android']}},
     }
     
     if os.path.exists(COOKIES_PATH):
