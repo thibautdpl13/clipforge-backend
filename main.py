@@ -1,16 +1,15 @@
+import os
+import subprocess
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import subprocess
-import json
-import os
 
 app = FastAPI()
 
-# Enable CORS so your Netlify frontend can talk to this Render backend
+# Enable CORS for your Netlify frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins for testing; restrict to your netlify domain later if desired
+    allow_origins=["*"],  # Allows all origins for testing; can be restricted to your Netlify URL later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -24,22 +23,23 @@ def read_root():
     return {"status": "ClipForge Backend is running!"}
 
 @app.post("/process-video")
-def process_video(data: VideoRequest):
-    video_url = data.url
+def process_video(request: VideoRequest):
+    video_url = request.url
     
     if not video_url:
-        raise HTTPException(status_code=400, detail="No URL provided")
+        raise HTTPException(status_code=400, HTTPException_detail="URL is required")
 
-    # yt-dlp command using extractor_args to bypass YouTube bot / sign-in walls via alternative clients
+    # yt-dlp command array using cookies and client fallback to bypass 429 errors
     command = [
         "yt-dlp",
         "--dump-json",
+        "--cookies", "cookies.txt",
         "--extractor-args", "youtube:player_client=android,web",
         video_url
     ]
 
     try:
-        # Run yt-dlp as a subprocess to extract video metadata and direct stream links
+        # Run yt-dlp as a subprocess
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
@@ -48,30 +48,16 @@ def process_video(data: VideoRequest):
             check=True
         )
         
-        # Parse the JSON output from yt-dlp
-        video_info = json.loads(result.stdout)
-        
         return {
             "success": True,
-            "title": video_info.get("title"),
-            "duration": video_info.get("duration"),
-            "thumbnail": video_info.get("thumbnail"),
-            "download_url": video_info.get("url")  # Direct playback/download link
+            "raw_output": result.stdout
         }
 
     except subprocess.CalledProcessError as e:
-        error_message = e.stderr.strip() if e.stderr else str(e)
+        # Capture yt-dlp errors for debugging
+        error_output = e.stderr or e.stdout
+        print(f"yt-dlp error: {error_output}")
         raise HTTPException(
-            status_code=500, 
-            detail=f"Video processing failed: {error_message}"
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=500, 
-            detail="Failed to parse video metadata from yt-dlp."
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Unexpected server error: {str(e)}"
+            status_code=500,
+            detail=f"Video processing failed: {error_output}"
         )
