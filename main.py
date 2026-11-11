@@ -119,9 +119,12 @@ async def generate_auto_clip(payload: VideoURL):
         if not os.path.exists(raw_video) or os.path.getsize(raw_video) == 0:
             raise HTTPException(status_code=500, detail="Downloaded segment file is missing or empty.")
             
+        # Safe scale-and-crop filter that accommodates any input resolution without failing
+        safe_filter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920:(iw-1080)/2:(ih-1920)/2"
+        
         ffmpeg_crop_cmd = [
             "ffmpeg", "-i", raw_video,
-            "-vf", "crop=ih*(9/16):ih:(iw-ih*(9/16))/2:0,scale=1080:1920",
+            "-vf", safe_filter,
             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
             output_clip, "-y"
         ]
