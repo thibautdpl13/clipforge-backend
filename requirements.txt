@@ -3,4 +3,3 @@ uvicorn
 yt-dlp>=2024.10.08
 youtube-transcript-api
 requests
-js2py
