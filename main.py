@@ -9,7 +9,7 @@ app = FastAPI()
 # Enable CORS for your Netlify frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Or specify your https://clip-forgeai.netlify.app domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -22,12 +22,13 @@ class VideoURL(BaseModel):
 async def process_video(payload: VideoURL):
     video_url = payload.url
     
-    # yt-dlp command using web/mweb clients to support cookies and JS challenge solving
+    # yt-dlp command using web client, cookies, and explicit Node.js JS interpreter
     command = [
         "yt-dlp",
         "--dump-json",
         "--cookies", "cookies.txt",
-        "--extractor-args", "youtube:player_client=web,mweb",
+        "--extractor-args", "youtube:player_client=web",
+        "--js-interpreter", "node",
         video_url
     ]
     
