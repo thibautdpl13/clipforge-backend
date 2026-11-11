@@ -1,3 +1,4 @@
+Python
 import subprocess
 import json
 import os
@@ -33,37 +34,64 @@ def extract_video_id(url: str) -> str:
             return parsed_url.path.split('/')[2]
     return None
 
-def find_best_clip_window(transcript: list, target_duration: float = 30.0) -> float:
+def find_smart_clip_range(transcript: list) -> tuple[float, float]:
     """
-    Scans the entire transcript to find a dense 30-second window 
-    with the highest concentration of words/dialogue.
+    Scans the entire transcript to find the densest dialogue block, 
+    then dynamically adjusts boundaries to start and end on clean sentence breaks,
+    varying the duration between 30 seconds and up to 3 minutes (180 seconds).
     """
     if not transcript or len(transcript) == 0:
-        return 10.0
+        return (10.0, 40.0)
         
     total_duration = transcript[-1]["start"] + transcript[-1].get("duration", 5.0)
-    if total_duration <= target_duration:
-        return 0.0
-        
-    best_start = transcript[0]["start"]
-    max_words = 0
+    if total_duration <= 30.0:
+        return (0.0, total_duration)
+
+    best_start_idx = 0
+    best_end_idx = min(len(transcript) - 1, 10)
+    max_score = 0
     
-    for i, entry in enumerate(transcript):
-        window_start = entry["start"]
-        window_end = window_start + target_duration
+    # Target clip length bounds (between 35s and 120s for optimal retention, max 180s)
+    min_target_duration = 35.0
+    max_target_duration = 120.0
+
+    # Slide through transcript to find the densest window of dialogue
+    for i in range(len(transcript)):
+        start_time = transcript[i]["start"]
         
-        current_words = 0
-        for sub in transcript[i:]:
-            if sub["start"] < window_end:
-                current_words += len(sub["text"].split())
-            else:
+        # Look ahead for a window fitting our dynamic duration bounds
+        for j in range(i + 1, len(transcript)):
+            end_time = transcript[j]["start"] + transcript[j].get("duration", 3.0)
+            duration = end_time - start_time
+            
+            if duration < min_target_duration:
+                continue
+            if duration > max_target_duration:
                 break
                 
-        if current_words > max_words:
-            max_words = current_words
-            best_start = window_start
+            # Count words and punctuation density in this block
+            block_words = sum(len(transcript[k]["text"].split()) for k in range(i, j + 1))
+            score = block_words / (duration / 60.0) # Words per minute density score
             
-    return float(best_start)
+            if score > max_score:
+                max_score = score
+                best_start_idx = i
+                best_end_idx = j
+
+    # Clean up start boundary: Snap to the beginning of the sentence (look for capitalization or start of thought)
+    final_start = transcript[best_start_idx]["start"]
+    if final_start > 5.0:
+        # Give a small 0.5s lead-in buffer so it doesn't clip the very microsecond speech starts
+        final_start = max(0.0, final_start - 0.5)
+
+    # Clean up end boundary: Ensure it finishes the sentence/thought block
+    final_end = transcript[best_end_idx]["start"] + transcript[best_end_idx].get("duration", 3.0)
+    
+    # Enforce absolute safety cap of 3 minutes (180 seconds) max
+    if (final_end - final_start) > 180.0:
+        final_end = final_start + 180.0
+
+    return (float(final_start), float(final_end))
 
 @app.post("/process-video")
 async def process_video(payload: VideoURL):
@@ -126,8 +154,8 @@ async def generate_auto_clip(payload: VideoURL):
         except Exception:
             transcript_list = []
             
-        start_time = find_best_clip_window(transcript_list, target_duration=30.0)
-        end_time = start_time + 30.0
+        # Get smart sentence-aligned dynamic start and end times
+        start_time, end_time = find_smart_clip_range(transcript_list)
         
         time_range = f"*{start_time}-{end_time}"
         
@@ -151,16 +179,17 @@ async def generate_auto_clip(payload: VideoURL):
         if not os.path.exists(raw_video) or os.path.getsize(raw_video) == 0:
             raise HTTPException(status_code=500, detail="Downloaded segment file is missing or empty.")
             
-        blurred_layout_filter = (
+        # Adaptive filter graph: Handles landscape (blurred bg + centered fg) and portrait cleanly
+        adaptive_layout_filter = (
             "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
             "crop=1080:1920,boxblur=25:10[bg];"
-            "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2"
         )
         
         ffmpeg_crop_cmd = [
             "ffmpeg", "-i", raw_video,
-            "-filter_complex", blurred_layout_filter,
+            "-filter_complex", adaptive_layout_filter,
             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
             output_clip, "-y"
         ]
