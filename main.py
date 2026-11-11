@@ -92,9 +92,9 @@ async def generate_auto_clip(payload: VideoURL):
         try:
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
         except Exception:
-            transcript_list = [{"start": 0.0, "duration": 5.0, "text": "Introduction"}]
+            transcript_list = []
             
-        start_time = float(transcript_list[0]["start"]) if transcript_list else 0.0
+        start_time = float(transcript_list[0]["start"]) if transcript_list and len(transcript_list) > 0 else 10.0
         end_time = start_time + 30.0
         
         time_range = f"*{start_time}-{end_time}"
@@ -105,15 +105,19 @@ async def generate_auto_clip(payload: VideoURL):
             "--remote-components", "ejs:github",
             "--extractor-args", "youtube:player_client=default,web_embedded",
             "--download-sections", time_range,
-            "--format", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+            "--format", "mp4/best",
             "--output", raw_video,
             payload.url
         ]
         
-        subprocess.run(download_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.run(download_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
-        if not os.path.exists(raw_video):
-            raise HTTPException(status_code=500, detail="Failed to download video segment.")
+        if process.returncode != 0:
+            error_output = process.stderr.strip() if process.stderr else "Unknown yt-dlp error"
+            raise HTTPException(status_code=500, detail=f"yt-dlp download failed: {error_output}")
+        
+        if not os.path.exists(raw_video) or os.path.getsize(raw_video) == 0:
+            raise HTTPException(status_code=500, detail="Downloaded segment file is missing or empty.")
             
         ffmpeg_crop_cmd = [
             "ffmpeg", "-i", raw_video,
@@ -121,13 +125,18 @@ async def generate_auto_clip(payload: VideoURL):
             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
             output_clip, "-y"
         ]
-        subprocess.run(ffmpeg_crop_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ffmpeg_process = subprocess.run(ffmpeg_crop_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        if ffmpeg_process.returncode != 0:
+            if os.path.exists(raw_video):
+                os.remove(raw_video)
+            raise HTTPException(status_code=500, detail=f"FFmpeg processing failed: {ffmpeg_process.stderr.strip()}")
         
         if os.path.exists(raw_video):
             os.remove(raw_video)
             
         if not os.path.exists(output_clip):
-            raise HTTPException(status_code=500, detail="Failed to render vertical short.")
+            raise HTTPException(status_code=500, detail="Failed to render vertical short file.")
             
         return FileResponse(
             output_clip,
@@ -135,12 +144,11 @@ async def generate_auto_clip(payload: VideoURL):
             filename="viral_short.mp4"
         )
         
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e)
-        raise HTTPException(status_code=400, detail=f"Processing pipeline failed: {error_msg}")
+    except HTTPException as he:
+        raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.get("/")
 def read_root():
-    return {"status": "ClipForge Deno-backed Docker container is running smoothly!"}
+    return {"status": "ClipForge Docker Backend is running with Deno runtime!"}
