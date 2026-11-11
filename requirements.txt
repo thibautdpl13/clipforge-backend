@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-yt-dlp
+yt-dlp>=2024.10.08
 youtube-transcript-api
-pydantic
+requests
