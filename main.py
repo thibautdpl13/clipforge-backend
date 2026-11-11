@@ -33,6 +33,38 @@ def extract_video_id(url: str) -> str:
             return parsed_url.path.split('/')[2]
     return None
 
+def find_best_clip_window(transcript: list, target_duration: float = 30.0) -> float:
+    """
+    Scans the entire transcript to find a dense 30-second window 
+    with the highest concentration of words/dialogue.
+    """
+    if not transcript or len(transcript) == 0:
+        return 10.0
+        
+    total_duration = transcript[-1]["start"] + transcript[-1].get("duration", 5.0)
+    if total_duration <= target_duration:
+        return 0.0
+        
+    best_start = transcript[0]["start"]
+    max_words = 0
+    
+    for i, entry in enumerate(transcript):
+        window_start = entry["start"]
+        window_end = window_start + target_duration
+        
+        current_words = 0
+        for sub in transcript[i:]:
+            if sub["start"] < window_end:
+                current_words += len(sub["text"].split())
+            else:
+                break
+                
+        if current_words > max_words:
+            max_words = current_words
+            best_start = window_start
+            
+    return float(best_start)
+
 @app.post("/process-video")
 async def process_video(payload: VideoURL):
     video_url = payload.url
@@ -94,7 +126,7 @@ async def generate_auto_clip(payload: VideoURL):
         except Exception:
             transcript_list = []
             
-        start_time = float(transcript_list[0]["start"]) if transcript_list and len(transcript_list) > 0 else 10.0
+        start_time = find_best_clip_window(transcript_list, target_duration=30.0)
         end_time = start_time + 30.0
         
         time_range = f"*{start_time}-{end_time}"
@@ -119,12 +151,16 @@ async def generate_auto_clip(payload: VideoURL):
         if not os.path.exists(raw_video) or os.path.getsize(raw_video) == 0:
             raise HTTPException(status_code=500, detail="Downloaded segment file is missing or empty.")
             
-        # Safe scale-and-crop filter that accommodates any input resolution without failing
-        safe_filter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920:(iw-1080)/2:(ih-1920)/2"
+        blurred_layout_filter = (
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,boxblur=25:10[bg];"
+            "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2"
+        )
         
         ffmpeg_crop_cmd = [
             "ffmpeg", "-i", raw_video,
-            "-vf", safe_filter,
+            "-filter_complex", blurred_layout_filter,
             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
             output_clip, "-y"
         ]
