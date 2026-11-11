@@ -1,5 +1,5 @@
-import os
 import subprocess
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -9,37 +9,30 @@ app = FastAPI()
 # Enable CORS for your Netlify frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins for testing; can be restricted to your Netlify URL later
+    allow_origins=["*"],  # Or specify your https://clip-forgeai.netlify.app domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class VideoRequest(BaseModel):
+class VideoURL(BaseModel):
     url: str
 
-@app.get("/")
-def read_root():
-    return {"status": "ClipForge Backend is running!"}
-
 @app.post("/process-video")
-def process_video(request: VideoRequest):
-    video_url = request.url
+async def process_video(payload: VideoURL):
+    video_url = payload.url
     
-    if not video_url:
-        raise HTTPException(status_code=400, HTTPException_detail="URL is required")
-
-    # yt-dlp command array using cookies and client fallback to bypass 429 errors
+    # yt-dlp command using web/mweb clients to support cookies and JS challenge solving
     command = [
         "yt-dlp",
         "--dump-json",
         "--cookies", "cookies.txt",
-        "--extractor-args", "youtube:player_client=android,web",
+        "--extractor-args", "youtube:player_client=web,mweb",
         video_url
     ]
-
+    
     try:
-        # Run yt-dlp as a subprocess
+        # Run yt-dlp and capture output
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
@@ -48,16 +41,29 @@ def process_video(request: VideoRequest):
             check=True
         )
         
+        # Parse the JSON metadata returned by yt-dlp
+        video_data = json.loads(result.stdout)
+        
         return {
             "success": True,
-            "raw_output": result.stdout
+            "title": video_data.get("title"),
+            "duration": video_data.get("duration"),
+            "thumbnail": video_data.get("thumbnail"),
+            "formats": video_data.get("formats", [])
         }
-
+        
     except subprocess.CalledProcessError as e:
-        # Capture yt-dlp errors for debugging
-        error_output = e.stderr or e.stdout
-        print(f"yt-dlp error: {error_output}")
+        error_message = e.stderr.strip() if e.stderr else str(e)
         raise HTTPException(
-            status_code=500,
-            detail=f"Video processing failed: {error_output}"
+            status_code=400, 
+            detail=f"Video processing failed: {error_message}"
         )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Internal server error: {str(e)}"
+        )
+
+@app.get("/")
+def read_root():
+    return {"status": "ClipForge Backend is running!"}
