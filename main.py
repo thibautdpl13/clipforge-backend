@@ -39,8 +39,10 @@ async def process_video(payload: VideoURL):
     
     command = [
         "yt-dlp",
-        "--dump-json",
         "--cookies", "cookies.txt",
+        "--js-runtimes", "node",
+        "--remote-components", "ejs:github",
+        "--dump-json",
         "--extractor-args", "youtube:player_client=default,web_embedded",
         "--ignore-no-formats-error",
         video_url
@@ -101,12 +103,15 @@ async def generate_auto_clip(payload: VideoURL):
         download_cmd = [
             "yt-dlp",
             "--cookies", "cookies.txt",
+            "--js-runtimes", "node",
+            "--remote-components", "ejs:github",
             "--extractor-args", "youtube:player_client=default,web_embedded",
             "--download-sections", time_range,
             "--format", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
             "--output", raw_video,
             payload.url
         ]
+        
         subprocess.run(download_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         if not os.path.exists(raw_video):
@@ -140,4 +145,4 @@ async def generate_auto_clip(payload: VideoURL):
 
 @app.get("/")
 def read_root():
-    return {"status": "ClipForge Automated Backend is running!"}
+    return {"status": "ClipForge Backend is running with cookies and JS runtime enabled!"}
