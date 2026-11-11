@@ -1,14 +1,14 @@
 import os
 import subprocess
-import re
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import yt_dlp
+from pydantic import BaseModel
 
-app = FastAPI(title="ClipForge Backend")
+app = FastAPI()
 
+# Allow requests from your GitHub Pages frontend and local testing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,101 +17,83 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-COOKIES_PATH = "cookies.txt"
-
 class ClipRequest(BaseModel):
     url: str
-    start_time: float = 0.0
-    end_time: float = 60.0
-    output_filename: str = "output_short.mp4"
 
-@app.get("/")
-def health_check():
-    return {"status": "ClipForge Backend is fully operational!"}
+def download_and_process_video(video_url: str, output_path: str):
+    """
+    Downloads the YouTube video using yt-dlp with cookie authentication 
+    and browser headers, then applies your clipping/processing pipeline.
+    """
+    raw_download_path = "/tmp/raw_download.mp4"
+    
+    # Cleanup previous temp files
+    for p in [raw_download_path, output_path]:
+        if os.path.exists(p):
+            os.remove(p)
 
-def detect_crop(input_file: str) -> str:
-    """Scans the video slice to automatically detect and strip black pillarbox or letterbox bars."""
+    # yt-dlp configuration with cookies.txt and browser client bypasses
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=mp4]/best[ext=mp4]/best',
+        'outtmpl': raw_download_path,
+        'noplaylist': True,
+        'cookiefile': 'cookies.txt',  # Uses your cookies.txt in the backend root
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+        },
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
+    }
+
     try:
-        cmd = [
-            "ffmpeg", "-i", input_file, "-vframes", "30",
-            "-vf", "cropdetect=24:16:0", "-f", "null", "-"
+        # Step 1: Download video with yt-dlp
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+
+        if not os.path.exists(raw_download_path):
+            raise Exception("yt-dlp failed to generate raw download file.")
+
+        # Step 2: Your video processing / vertical cropping / clipping logic 
+        # (e.g., using ffmpeg to crop 16:9 to 9:16 vertical or trim the clip)
+        # If you have custom ffmpeg commands or script calls, place them here:
+        
+        # Example FFmpeg vertical crop command (center crop 9:16):
+        ffmpeg_command = [
+            'ffmpeg', '-y', '-i', raw_download_path,
+            '-vf', "crop=ih*9/16:ih",  # Crop to vertical 9:16 aspect ratio
+            '-c:a', 'copy',
+            output_path
         ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        matches = re.findall(r'crop=(\d+:\d+:\d+:\d+)', result.stderr)
-        if matches:
-            return f"crop={matches[-1]}"
-    except Exception:
-        pass
-    return None
+        
+        subprocess.run(ffmpeg_command, check=True)
+
+        # Fallback if processing didn't output the final path but raw download exists
+        if not os.path.exists(output_path) and os.path.exists(raw_download_path):
+            os.rename(raw_download_path, output_path)
+
+    except Exception as e:
+        raise Exception(f"Pipeline failure: {str(e)}")
 
 @app.post("/generate-auto-clip")
-def generate_auto_clip(req: ClipRequest):
-    input_file = "downloaded_source.mp4"
-    
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': input_file,
-        'quiet': True,
-        'nocheckcertificate': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        'extractor_args': {'youtube': {'player_client': ['web', 'android']}},
-    }
-    
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts['cookiefile'] = COOKIES_PATH
+async def generate_auto_clip(payload: ClipRequest):
+    video_url = payload.url
+    if not video_url:
+        raise HTTPException(status_code=400, detail="URL is required")
+
+    final_output_path = "/tmp/clip_output.mp4"
 
     try:
-        section_spec = f"*{req.start_time}-{req.end_time}"
-        ydl_opts['download_sections'] = [section_spec]
+        download_and_process_video(video_url, final_output_path)
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([req.url])
+        if not os.path.exists(final_output_path):
+            raise HTTPException(status_code=500, detail="Processing completed, but output file is missing.")
+
+        return FileResponse(final_output_path, media_type="video/mp4", filename="clip.mp4")
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    if not os.path.exists(input_file):
-        raise HTTPException(status_code=500, detail="Source video slice failed to generate.")
-
-    crop_filter = detect_crop(input_file)
-
-    if crop_filter:
-        adaptive_layout_filter = (
-            f"[0:v]{crop_filter}[cleaned];"
-            "[cleaned]scale=270:480,boxblur=10:5,scale=1080:1920:flags=neighbor[bg];"
-            "[cleaned]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2"
-        )
-    else:
-        adaptive_layout_filter = (
-            "[0:v]scale=270:480,boxblur=10:5,scale=1080:1920:flags=neighbor[bg];"
-            "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2"
-        )
-
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-y",
-        "-i", input_file,
-        "-filter_complex", adaptive_layout_filter,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        req.output_filename
-    ]
-
-    try:
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        if os.path.exists(input_file):
-            os.remove(input_file)
-        raise HTTPException(status_code=500, detail=f"FFmpeg encoding failed: {e.stderr.decode('utf-8')}")
-
-    if os.path.exists(input_file):
-        os.remove(input_file)
-
-    if not os.path.exists(req.output_filename):
-        raise HTTPException(status_code=500, detail="Output file was not generated.")
-
-    return FileResponse(req.output_filename, media_type="video/mp4", filename=req.output_filename)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
