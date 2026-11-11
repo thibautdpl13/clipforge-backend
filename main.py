@@ -22,12 +22,12 @@ class VideoURL(BaseModel):
 async def process_video(payload: VideoURL):
     video_url = payload.url
     
-    # yt-dlp command using web client and cookies
+    # yt-dlp command using web_embedded client combo to bypass challenge failures
     command = [
         "yt-dlp",
         "--dump-json",
         "--cookies", "cookies.txt",
-        "--extractor-args", "youtube:player_client=web",
+        "--extractor-args", "youtube:player_client=default,web_embedded",
         video_url
     ]
     
