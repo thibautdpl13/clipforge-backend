@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-"yt-dlp[default]>=2024.10.08"
+yt-dlp[default]>=2024.10.08
 youtube-transcript-api
 requests
 pydantic
