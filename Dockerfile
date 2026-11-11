@@ -1,11 +1,15 @@
 FROM python:3.10-slim
 
-# Install Node.js (required for yt-dlp EJS challenge) and FFmpeg
+# Install system dependencies, curl, ffmpeg, and Deno runtime
 RUN apt-get update && apt-get install -y \
-    nodejs \
-    npm \
+    curl \
     ffmpeg \
+    ca-certificates \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Deno globally
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
 WORKDIR /app
 
