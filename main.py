@@ -6,7 +6,6 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# Enable CORS for your Netlify frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,17 +21,16 @@ class VideoURL(BaseModel):
 async def process_video(payload: VideoURL):
     video_url = payload.url
     
-    # yt-dlp command using web_embedded client combo to bypass challenge failures
+    # Use ios player client to bypass browser n challenge requirements on headless servers
     command = [
         "yt-dlp",
         "--dump-json",
         "--cookies", "cookies.txt",
-        "--extractor-args", "youtube:player_client=default,web_embedded",
+        "--extractor-args", "youtube:player_client=ios",
         video_url
     ]
     
     try:
-        # Run yt-dlp and capture output
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
@@ -41,7 +39,6 @@ async def process_video(payload: VideoURL):
             check=True
         )
         
-        # Parse the JSON metadata returned by yt-dlp
         video_data = json.loads(result.stdout)
         
         return {
