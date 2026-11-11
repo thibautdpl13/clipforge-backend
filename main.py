@@ -9,7 +9,7 @@ import yt_dlp
 
 app = FastAPI(title="ClipForge Backend")
 
-# Enable CORS so your frontend can communicate freely without blocks
+# Enable CORS so your frontend communicates without blocks
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,7 +20,7 @@ app.add_middleware(
 
 COOKIES_PATH = "cookies.txt"
 
-# Define the expected JSON body structure from your frontend
+# Expecting JSON body matching your frontend request
 class ClipRequest(BaseModel):
     url: str
     start_time: float = 0.0
@@ -29,7 +29,7 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "ClipForge Docker Backend is running with POST JSON support!"}
+    return {"status": "ClipForge Backend is fully operational!"}
 
 def detect_crop(input_file: str) -> str:
     """Scans the video slice to automatically detect and strip black pillarbox or letterbox bars."""
