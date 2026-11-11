@@ -53,7 +53,7 @@ def generate_auto_clip(req: ClipRequest):
         'outtmpl': input_file,
         'quiet': True,
         'nocheckcertificate': True,
-        'extractor_args': {'youtube': {'player_client': ['web_embedded', 'mweb']}},
+        'extractor_args': {'youtube': {'player_client': ['visionos', 'web_embedded', 'mweb']}},
     }
     
     if os.path.exists(COOKIES_PATH):
