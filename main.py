@@ -22,13 +22,12 @@ class VideoURL(BaseModel):
 async def process_video(payload: VideoURL):
     video_url = payload.url
     
-    # yt-dlp command using web client, cookies, and explicit Node.js JS interpreter
+    # yt-dlp command using web client and cookies
     command = [
         "yt-dlp",
         "--dump-json",
         "--cookies", "cookies.txt",
         "--extractor-args", "youtube:player_client=web",
-        "--js-interpreter", "node",
         video_url
     ]
     
