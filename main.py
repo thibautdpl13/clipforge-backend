@@ -45,7 +45,7 @@ def is_clean_ending(utterances, idx):
     has_pause = False
     if idx + 1 < len(utterances):
         gap = utterances[idx + 1]["start"] - utterances[idx]["end"]
-        if gap >= 0.6:
+        if gap >= 0.5:
             has_pause = True
     else:
         has_pause = True
@@ -58,9 +58,9 @@ def is_clean_start(utterances, idx):
     prev_text = utterances[idx - 1]["text"].strip()
     prev_ended = prev_text.endswith((".", "!", "?"))
     gap = utterances[idx]["start"] - utterances[idx - 1]["end"]
-    return prev_ended or gap >= 0.6
+    return prev_ended or gap >= 0.5
 
-HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen"}
+HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
 @app.post("/generate-auto-clip")
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
@@ -75,7 +75,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract auto-subtitles via yt-dlp using cookies, Deno runtime, and remote EJS components
+    # 1. Extract auto-subtitles via yt-dlp using cookies and Deno
     sub_cmd = [
         "yt-dlp",
         "--remote-components", "ejs:github",
@@ -123,7 +123,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     total_video_duration = utterances[-1]["end"] if utterances else 300.0
 
-    # 2. Viral Hook & Engagement Scoring Engine
+    # 2. Viral Hook & Continuous Window Scoring Engine
     best_start = None
     best_end = None
     highest_score = -1.0
@@ -139,30 +139,33 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
         first_text_lower = start_utt["text"].lower()
         has_hook = any(hw in first_text_lower for hw in HOOK_WORDS) or "?" in first_text_lower
-        start_bonus = 1.4 if has_hook else 0.9
+        start_bonus = 1.5 if has_hook else 0.8
 
         char_count = len(start_utt["text"])
         full_window_text = start_utt["text"]
 
         for j in range(i + 1, len(utterances)):
             utt_j = utterances[j]
+            if utt_j["start"] - utterances[j-1]["end"] > 3.0:
+                break
+
             char_count += len(utt_j["text"])
             full_window_text += " " + utt_j["text"]
             win_end = utt_j["end"]
             length = win_end - win_start
 
-            if length < 15:
+            if length < 20:
                 continue
-            if length > 178:
+            if length > 65:
                 break
 
             if not is_clean_ending(utterances, j):
                 continue
 
             density = char_count / length
-            punctuation_bonus = 1.0 + (min(full_window_text.count("?") + full_window_text.count("!"), 6) * 0.04)
+            punctuation_bonus = 1.0 + (min(full_window_text.count("?") + full_window_text.count("!"), 6) * 0.05)
             position_ratio = win_start / total_video_duration
-            pos_multiplier = 0.4 if (position_ratio < 0.03 or position_ratio > 0.97) else 1.0
+            pos_multiplier = 0.3 if (position_ratio < 0.02 or position_ratio > 0.98) else 1.0
 
             viral_score = density * start_bonus * punctuation_bonus * pos_multiplier
 
@@ -173,17 +176,35 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     if best_start is None or best_end is None:
         best_start = next((u["start"] for u in utterances if u["start"] >= 15), utterances[0]["start"])
-        valid_ends = [u["end"] for u in utterances if 15 <= (u["end"] - best_start) <= 178]
-        best_end = valid_ends[len(valid_ends) // 2] if valid_ends else best_start + 30
+        best_end = min(best_start + 45.0, utterances[-1]["end"])
 
     start_time = max(0.0, round(best_start - 0.2, 2))
-    end_time = round(min(best_start + 180.0, best_end + 0.4), 2)
+    end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Generate precise SRT subtitle file for this exact clip window
+    # 3. Precision Subtitle Chunking (3-4 words per frame, uppercase, TikTok layout style)
     clip_utterances = [
         u for u in utterances 
         if u["end"] > best_start and u["start"] < best_end
     ]
+
+    chunked_subtitles = []
+    for u in clip_utterances:
+        words = u["text"].strip().upper().split()
+        if not words:
+            continue
+        u_duration = max(0.4, u["end"] - u["start"])
+        word_duration = u_duration / len(words)
+
+        chunk_size = 4
+        for idx_w in range(0, len(words), chunk_size):
+            chunk_words = words[idx_w:idx_w + chunk_size]
+            chunk_text = " ".join(chunk_words)
+            c_start = u["start"] + (idx_w * word_duration) - best_start
+            c_end = c_start + (len(chunk_words) * word_duration)
+            
+            c_start = max(0.0, c_start)
+            c_end = max(c_start + 0.35, c_end)
+            chunked_subtitles.append({"start": c_start, "end": c_end, "text": chunk_text})
 
     def fmt_time(seconds):
         h = int(seconds // 3600)
@@ -193,14 +214,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
     with open(srt_path, "w", encoding="utf-8") as f:
-        for idx, u in enumerate(clip_utterances, 1):
-            s_start = max(0.0, u["start"] - best_start)
-            s_end = u["end"] - best_start
-            if s_end <= s_start:
-                s_end = s_start + 0.5
-            f.write(f"{idx}\n{fmt_time(s_start)} --> {fmt_time(s_end)}\n{u['text'].strip()}\n\n")
+        for idx, sub in enumerate(chunked_subtitles, 1):
+            f.write(f"{idx}\n{fmt_time(sub['start'])} --> {fmt_time(sub['end'])}\n{sub['text']}\n\n")
 
-    # 4. Download exact dynamically sized window via yt-dlp using cookies
+    # 4. Download exact window via yt-dlp
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
@@ -222,9 +239,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 5. Render vertical clip + Burn-in Auto Subtitles via FFmpeg
-    # Styles: Bright yellow text, bold black outline, centered near the bottom
-    subtitles_filter = f"subtitles={srt_path}:force_style='FontSize=28,PrimaryColour=&H00FFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2,Alignment=2,MarginV=150'"
+    # 5. Render vertical clip + TikTok Style Subtitles via FFmpeg
+    # Styling: Bold uppercase white text, thick black outline, positioned in the middle-lower zone (MarginV=650)
+    subtitles_filter = f"subtitles={srt_path}:force_style='FontName=Arial,FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=3,Alignment=2,MarginV=650'"
     video_filter = f"scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,{subtitles_filter}"
 
     ffmpeg_cmd = [
@@ -243,7 +260,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     try:
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"FFmpeg subtitle burning failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {e.stderr.decode('utf-8', errors='ignore')}")
 
     if not os.path.exists(output_path):
         raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
