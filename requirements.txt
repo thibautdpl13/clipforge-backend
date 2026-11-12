@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-yt-dlp>=2025.0.0
+yt-dlp>=2026.0.0
 pydantic
 python-multipart
