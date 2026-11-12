@@ -181,7 +181,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Subtitle Chunking (3 words per frame, strict non-overlapping timestamps)
+    # 3. Precision Subtitle Chunking with strict spacing and non-overlapping bounds
     clip_utterances = [
         u for u in utterances 
         if u["end"] > best_start and u["start"] < best_end
@@ -189,6 +189,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     raw_chunks = []
     for u in clip_utterances:
+        # Split individual words and clean them
         words = u["text"].strip().upper().split()
         if not words:
             continue
@@ -198,7 +199,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         chunk_size = 3
         for idx_w in range(0, len(words), chunk_size):
             chunk_words = words[idx_w:idx_w + chunk_size]
-            chunk_text = " ".join(chunk_words)
+            chunk_text = " ".join(chunk_words)  # Ensures proper spacing between words!
             c_start = u["start"] + (idx_w * word_duration) - best_start
             c_end = c_start + (len(chunk_words) * word_duration)
             raw_chunks.append({"start": max(0.0, c_start), "end": max(c_start + 0.25, c_end), "text": chunk_text})
@@ -207,6 +208,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     for i, rc in enumerate(raw_chunks):
         start_t = rc["start"]
         end_t = rc["end"]
+        # Force end time to not overlap with the next chunk's start time
         if i + 1 < len(raw_chunks):
             next_start = raw_chunks[i + 1]["start"]
             if end_t > next_start:
@@ -237,7 +239,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 5. Render vertical clip + Perfectly positioned & sized drawtext subtitles
+    # 5. Render vertical clip + cleanly spaced drawtext subtitles
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
