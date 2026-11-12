@@ -25,7 +25,6 @@ COOKIES_PATH = "/tmp/cookies.txt"
 def startup_event():
     cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookie_content:
-        # Normalize line endings and ensure Netscape header exists for Render's textarea
         cookie_content = cookie_content.replace("\r\n", "\n")
         if not cookie_content.startswith("# Netscape"):
             cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
@@ -107,7 +106,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Native Python yt-dlp extraction for subtitles with client emulation & cookies
+    # 1. Native Python yt-dlp extraction for subtitles
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -115,7 +114,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_sub['cookiefile'] = COOKIES_PATH
@@ -236,13 +234,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video with robust fallback format selector and cookies
+    # 4. Download source video cleanly using yt-dlp defaults (no restrictive format or client flags)
     ydl_opts_video = {
-        'format': 'bv*+ba/b',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
