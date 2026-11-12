@@ -17,6 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source code
 COPY . .
 
+# Set yt-dlp remote components environment variable globally
+ENV YT_DLP_REMOTE_COMPONENTS="ejs:github"
+
 # Expose Render's default port
 EXPOSE 10000
 
