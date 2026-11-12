@@ -75,10 +75,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract subtitles: Manual human-written first, fallback to auto-subs
+    # 1. Extract subtitles: Manual human-written first, fallback to auto-subs with player client extractor args
     sub_cmd_manual = [
         "yt-dlp",
         "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=android,web",
         "--write-subs",
         "--sub-format", "json3",
         "--skip-download",
@@ -88,6 +89,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     sub_cmd_auto = [
         "yt-dlp",
         "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=android,web",
         "--write-auto-subs",
         "--sub-format", "json3",
         "--skip-download",
@@ -255,11 +257,12 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 5. Download exact window via yt-dlp
+    # 5. Download exact window via yt-dlp with player client extractor args
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
         "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=android,web",
         "--format", "best[ext=mp4]/best",
         "--download-sections", section_range,
         "--output", raw_video_path,
