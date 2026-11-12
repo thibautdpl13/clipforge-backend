@@ -19,6 +19,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+COOKIES_PATH = "/tmp/cookies.txt"
+
+@app.on_event("startup")
+def startup_event():
+    # Automatically write cookies from Render environment variable on boot
+    cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if cookie_content:
+        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+            f.write(cookie_content)
+        print("Successfully loaded YouTube cookies from environment variables.")
+    else:
+        print("Warning: YOUTUBE_COOKIES environment variable not found.")
+
 class ClipRequest(BaseModel):
     url: str
 
@@ -27,7 +40,6 @@ def health_check():
     return {"status": "running", "service": "ClipForge AI Backend"}
 
 def is_clean_ending(utterances, idx):
-    """Checks if utterance at idx ends a complete sentence or has a natural speech pause after it."""
     text = utterances[idx]["text"].strip()
     ends_with_punct = text.endswith((".", "!", "?"))
     
@@ -42,7 +54,6 @@ def is_clean_ending(utterances, idx):
     return ends_with_punct or has_pause
 
 def is_clean_start(utterances, idx):
-    """Checks if utterance at idx starts after a completed sentence or natural pause."""
     if idx == 0:
         return True
     prev_text = utterances[idx - 1]["text"].strip()
@@ -62,16 +73,18 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract auto-subtitles via yt-dlp + local Rust PO Token server (bypasses cloud IP block)
+    # 1. Extract auto-subtitles via yt-dlp using cookies
     sub_cmd = [
         "yt-dlp",
         "--write-auto-subs",
         "--sub-format", "json3",
         "--skip-download",
-        "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
         "--output", "/tmp/sub",
         request.url
     ]
+
+    if os.path.exists(COOKIES_PATH):
+        sub_cmd.extend(["--cookies", COOKIES_PATH])
 
     try:
         subprocess.run(sub_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -80,7 +93,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     sub_files = glob.glob("/tmp/sub.*.json3")
     if not sub_files:
-        raise HTTPException(status_code=400, detail="Transcript analysis failed: No auto-captions available for this video.")
+        raise HTTPException(status_code=400, detail="Metadata analysis failed: No auto-captions available for this video.")
 
     try:
         with open(sub_files[0], "r", encoding="utf-8") as f:
@@ -148,16 +161,18 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 180.0, best_end + 0.4), 2)
 
-    # 3. Download exact dynamically sized window via yt-dlp + PO token server
+    # 3. Download exact dynamically sized window via yt-dlp using cookies
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
         "--format", "best[ext=mp4]/best",
-        "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
         "--download-sections", section_range,
         "--output", raw_video_path,
         request.url
     ]
+
+    if os.path.exists(COOKIES_PATH):
+        yt_dlp_cmd.extend(["--cookies", COOKIES_PATH])
 
     try:
         subprocess.run(yt_dlp_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
