@@ -234,7 +234,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using robust bv*+ba/b format selector and cookies
+    # 4. Download source video with bulletproof format fallback (tries split streams, falls back to 'best')
     ydl_opts_video = {
         'format': 'bv*+ba/b',
         'outtmpl': raw_video_path,
@@ -248,7 +248,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
             ydl.download([request.url])
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"YouTube download failed: {str(e)}")
+        print(f"Primary format download failed ({str(e)}), falling back to 'best' format...")
+        ydl_opts_video['format'] = 'best'
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
+                ydl.download([request.url])
+        except Exception as e2:
+            raise HTTPException(status_code=400, detail=f"YouTube download failed completely: {str(e2)}")
 
     downloaded_files = glob.glob("/tmp/raw_download.*")
     if downloaded_files:
