@@ -20,5 +20,5 @@ COPY . .
 # Expose Render's default port
 EXPOSE 10000
 
-# Start FastAPI server using Uvicorn
-CMD ["uvicorn", "main.py:app", "--host", "0.0.0.0", "--port", "10000"]
+# Start FastAPI server using Uvicorn (Fixed: main:app instead of main.py:app)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
