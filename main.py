@@ -235,12 +235,12 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video with robust format string and iOS client emulation
+    # 4. Download source video using format_sort instead of a rigid format string (prevents missing format crashes)
     ydl_opts_video = {
-        'format': 'bestvideo+bestaudio/best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
+        'format_sort': ['vcodec:h264', 'quality', 'res', 'fps', 'acodec:aac'],
         'extractor_args': {'youtube': {'player_client': ['ios', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
