@@ -234,8 +234,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using clean authenticated browser session defaults
+    # 4. Download source video using robust bv*+ba/b format selector and cookies
     ydl_opts_video = {
+        'format': 'bv*+ba/b',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
