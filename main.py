@@ -181,7 +181,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Subtitle Chunking (3-4 words per frame, uppercase, TikTok layout style)
+    # 3. Precision Subtitle Chunking (3-4 words per frame, uppercase)
     clip_utterances = [
         u for u in utterances 
         if u["end"] > best_start and u["start"] < best_end
@@ -206,17 +206,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             c_end = max(c_start + 0.35, c_end)
             chunked_subtitles.append({"start": c_start, "end": c_end, "text": chunk_text})
 
-    def fmt_time(seconds):
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        ms = int((seconds - int(seconds)) * 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for idx, sub in enumerate(chunked_subtitles, 1):
-            f.write(f"{idx}\n{fmt_time(sub['start'])} --> {fmt_time(sub['end'])}\n{sub['text']}\n\n")
-
     # 4. Download exact window via yt-dlp
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
@@ -239,10 +228,25 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 5. Render vertical clip + Guaranteed Subtitles with explicit fallback font path for Debian/Render slim container
-    escaped_srt = srt_path.replace("\\", "/").replace(":", "\\:")
-    sub_style = "FontName=DejaVuSans-Bold,FontSize=32,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=3,Alignment=2,MarginV=650"
-    video_filter = f"scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,subtitles={escaped_srt}:force_style='{sub_style}'"
+    # 5. Render vertical clip + Guaranteed Subtitles via FFmpeg drawtext filter
+    vf_filters = [
+        "scale=1080:1920:force_original_aspect_ratio=decrease",
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+    ]
+
+    for sub in chunked_subtitles:
+        safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%")
+        draw_filter = (
+            f"drawtext=text='{safe_text}':"
+            f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"fontsize=32:fontcolor=white:"
+            f"borderw=3:bordercolor=black:"
+            f"x=(w-text_w)/2:y=1920-650:"
+            f"enable='between(t,{sub['start']},{sub['end']})'"
+        )
+        vf_filters.append(draw_filter)
+
+    video_filter = ",".join(vf_filters)
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
