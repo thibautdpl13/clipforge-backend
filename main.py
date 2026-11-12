@@ -2,7 +2,6 @@ import os
 import re
 import glob
 import subprocess
-from urllib.parse import urlparse, parse_qs
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -106,7 +105,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Native Python yt-dlp extraction for subtitles using authenticated cookies and mweb client
+    # 1. Native Python yt-dlp extraction for subtitles using cookies and remote components JS solver
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -114,6 +113,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
+        'remote_components': {'ejs': 'github'},
         'extractor_args': {'youtube': {'player_client': ['mweb', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
@@ -235,12 +235,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using flexible format fallback and mweb client emulation
+    # 4. Download source video with remote components challenge solver and format fallback
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
+        'remote_components': {'ejs': 'github'},
         'extractor_args': {'youtube': {'player_client': ['mweb', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):

@@ -1,6 +1,6 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# Install system dependencies: Node.js (for yt-dlp n-challenge decryption), FFmpeg, and curl/git
+# Install system dependencies: Node.js, NPM, FFmpeg, and git
 RUN apt-get update && apt-get install -y \
     nodejs \
     npm \
@@ -20,5 +20,5 @@ COPY . .
 # Expose Render's default port
 EXPOSE 10000
 
-# Start FastAPI server using Uvicorn (Fixed: main:app instead of main.py:app)
+# Start FastAPI server using Uvicorn
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
