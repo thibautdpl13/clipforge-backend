@@ -60,6 +60,9 @@ def is_clean_start(utterances, idx):
     gap = utterances[idx]["start"] - utterances[idx - 1]["end"]
     return prev_ended or gap >= 0.6
 
+# Viral Hook keywords that signal high-engagement opening lines
+HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen"}
+
 @app.post("/generate-auto-clip")
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     raw_video_path = "/tmp/raw_download.mp4"
@@ -118,7 +121,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not utterances:
         raise HTTPException(status_code=400, detail="Transcript analysis failed: Subtitles are empty.")
 
-    # 2. Dynamic AI Window Scoring (15s to 180s, density-based, strict sentence boundaries)
+    total_video_duration = utterances[-1]["end"] if utterances else 300.0
+
+    # 2. Viral Hook & Engagement Scoring Engine
     best_start = None
     best_end = None
     highest_score = -1.0
@@ -126,15 +131,25 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     for i, start_utt in enumerate(utterances):
         win_start = start_utt["start"]
 
-        if win_start < 10:
+        if win_start < 15:
             continue
 
-        start_bonus = 1.15 if is_clean_start(utterances, i) else 0.85
+        if not is_clean_start(utterances, i):
+            continue
+
+        # Check for hook words or questions right at the start of the clip window
+        first_text_lower = start_utt["text"].lower()
+        has_hook = any(hw in first_text_lower for hw in HOOK_WORDS) or "?" in first_text_lower
+        start_bonus = 1.4 if has_hook else 0.9
+
         char_count = len(start_utt["text"])
+        full_window_text = start_utt["text"]
 
         for j in range(i + 1, len(utterances)):
-            char_count += len(utterances[j]["text"])
-            win_end = utterances[j]["end"]
+            utt_j = utterances[j]
+            char_count += len(utt_j["text"])
+            full_window_text += " " + utt_j["text"]
+            win_end = utt_j["end"]
             length = win_end - win_start
 
             if length < 15:
@@ -145,16 +160,25 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             if not is_clean_ending(utterances, j):
                 continue
 
+            # Density & Energy calculation
             density = char_count / length
-            score = density * start_bonus
+            
+            # Reward exclamation marks and question marks inside the window (indicates high energy / debate)
+            punctuation_bonus = 1.0 + (min(full_window_text.count("?") + full_window_text.count("!"), 6) * 0.04)
 
-            if score > highest_score:
-                highest_score = score
+            # Position penalty: Avoid extreme intro / outro fluff
+            position_ratio = win_start / total_video_duration
+            pos_multiplier = 0.4 if (position_ratio < 0.03 or position_ratio > 0.97) else 1.0
+
+            viral_score = density * start_bonus * punctuation_bonus * pos_multiplier
+
+            if viral_score > highest_score:
+                highest_score = viral_score
                 best_start = win_start
                 best_end = win_end
 
     if best_start is None or best_end is None:
-        best_start = next((u["start"] for u in utterances if u["start"] >= 10), utterances[0]["start"])
+        best_start = next((u["start"] for u in utterances if u["start"] >= 15), utterances[0]["start"])
         valid_ends = [u["end"] for u in utterances if 15 <= (u["end"] - best_start) <= 178]
         best_end = valid_ends[len(valid_ends) // 2] if valid_ends else best_start + 30
 
