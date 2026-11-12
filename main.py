@@ -123,7 +123,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     events = sub_data.get("events", [])
     
-    # 2. Extract precise word-level timestamps directly from subtitle segments (segs)
+    # 2. Extract precise word-level timestamps (preserving apostrophes, cleaning hyphens)
     word_timed_list = []
     for ev in events:
         start_ms = ev.get("tStartMs")
@@ -140,13 +140,16 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             seg_count = len(segs)
             time_per_seg = total_event_duration / max(1, seg_count)
             for idx, seg in enumerate(segs):
-                w_text = seg.get("utf8", "").replace("-", "").strip()
+                w_text = seg.get("utf8", "")
+                if w_text == "-":
+                    continue
+                w_text = w_text.strip()
                 if w_text and w_text != "\n":
                     w_start = base_start + (idx * time_per_seg)
                     w_end = w_start + time_per_seg
                     word_timed_list.append({"start": w_start, "end": w_end, "text": w_text})
         else:
-            ev_text = "".join(seg.get("utf8", "") for seg in segs).replace("-", "").strip()
+            ev_text = "".join(seg.get("utf8", "") for seg in segs).replace(" - ", " ").strip()
             if ev_text and ev_text != "\n":
                 word_timed_list.append({"start": base_start, "end": base_start + total_event_duration, "text": ev_text})
 
@@ -196,7 +199,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 4. Precision Character-Based Chunking with Strict Contiguous Handover (Zero Overlap, Zero Gaps)
+    # 4. Precision Character-Based Chunking
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -242,20 +245,41 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             "text": chunk_text
         })
 
-    # Strict contiguous handover: Each chunk ends exactly when the next one starts (Zero overlap, zero gaps)
+    # 5. Strict 0-Buffer & Non-Overlapping Timeline Enforcement
+    # Sort raw chunks by start time to guarantee proper sequence
+    raw_chunks.sort(key=lambda x: x["start"])
+
     chunked_subtitles = []
     for i, rc in enumerate(raw_chunks):
         start_t = rc["start"]
         end_t = rc["end"]
-        if i + 1 < len(raw_chunks):
-            next_start = raw_chunks[i + 1]["start"]
-            end_t = next_start  # Hand over control instantly at next word start
-        else:
-            end_t = rc["end"] + 1.0  # Linger final chunk slightly
+        if end_t <= start_t:
+            end_t = start_t + 0.3
             
-        chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
+        chunked_subtitles.append({
+            "start": start_t,
+            "end": end_t,
+            "text": rc["text"]
+        })
 
-    # 5. Download exact window via yt-dlp
+    # Force exact 0-buffer handover: Each chunk ends exactly where the next one starts
+    for i in range(len(chunked_subtitles) - 1):
+        next_start = chunked_subtitles[i + 1]["start"]
+        if next_start > chunked_subtitles[i]["start"]:
+            chunked_subtitles[i]["end"] = next_start
+        else:
+            # Prevent inversion if timestamps collide
+            chunked_subtitles[i + 1]["start"] = chunked_subtitles[i]["end"]
+
+    # Final cleanup of rounding
+    for sub in chunked_subtitles:
+        sub["start"] = round(sub["start"], 3)
+        sub["end"] = round(sub["end"], 3)
+
+    if chunked_subtitles:
+        chunked_subtitles[-1]["end"] = round(chunked_subtitles[-1]["start"] + 1.5, 3)
+
+    # 6. Download exact window via yt-dlp
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
@@ -277,7 +301,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 6. Render vertical clip + Asap Extra Bold font, smaller shadow, and zero-overlap continuous display
+    # 7. Render vertical clip + Asap Black font, small shadow, zero overlap/zero buffer
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -287,7 +311,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%")
         draw_filter = (
             f"drawtext=text='{safe_text}':"
-            f"fontfile=/usr/share/fonts/truetype/asap/Asap-ExtraBold.ttf:"
+            f"fontfile=/usr/share/fonts/truetype/asap/Asap-Black.ttf:"
             f"fontsize=55:fontcolor=white:"
             f"borderw=4:bordercolor=black:"
             f"shadowx=1:shadowy=1:shadowcolor=black@0.8:"
