@@ -96,10 +96,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # Use authenticated cookies to bypass PO token restriction entirely
+    # Use android player client to bypass web PO token restrictions entirely
     sub_cmd_manual = [
         "yt-dlp",
         "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=android",
         "--write-subs",
         "--sub-format", "vtt",
         "--skip-download",
@@ -109,6 +110,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     sub_cmd_auto = [
         "yt-dlp",
         "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=android",
         "--write-auto-subs",
         "--sub-format", "vtt",
         "--skip-download",
@@ -132,7 +134,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         if not sub_files:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Subtitle extraction blocked by PO Token. Please update your YOUTUBE_COOKIES environment variable on Render with a fresh exported cookies.txt file from your browser. Manual: {manual_output[-200:]}"
+                detail=f"Subtitle extraction failed via Android client: Manual: {manual_output[-200:]} | Auto: {auto_output[-200:]}"
             )
 
     try:
@@ -246,6 +248,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     yt_dlp_cmd = [
         "yt-dlp",
         "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=android",
         "--format", "best[ext=mp4]/best",
         "--download-sections", section_range,
         "--output", raw_video_path,
