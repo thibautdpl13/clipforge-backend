@@ -189,7 +189,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Subtitle Chunking based on Character Count (~22 chars per card for optimal width)
+    # 3. Precision Character-Based Chunking with 100% Transcript Sync
     clip_utterances = [
         u for u in utterances 
         if u["end"] > best_start and u["start"] < best_end
@@ -206,37 +206,41 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         if not words:
             continue
             
-        u_duration = max(0.3, u["end"] - u["start"])
+        u_start = max(0.0, u["start"] - best_start)
+        u_end = max(u_start + 0.2, u["end"] - best_start)
+        u_duration = u_end - u_start
         total_chars = len(text)
         
         current_chunk_words = []
         current_chunk_len = 0
-        chunk_start_ratio = 0.0
+        chunk_start_char_idx = 0
         
-        word_char_count = 0
+        char_counter = 0
         for i, word in enumerate(words):
             word_len = len(word) + 1
             if current_chunk_len + word_len > MAX_CHARS_PER_LINE and current_chunk_words:
                 chunk_text = " ".join(current_chunk_words)
-                c_duration = (len(chunk_text) / total_chars) * u_duration
-                c_start = u["start"] + chunk_start_ratio * u_duration - best_start
-                c_end = c_start + c_duration
-                raw_chunks.append({"start": max(0.0, c_start), "end": max(c_start + 0.3, c_end), "text": chunk_text})
+                chunk_char_len = len(chunk_text)
                 
-                chunk_start_ratio = word_char_count / total_chars
+                c_start = u_start + (chunk_start_char_idx / total_chars) * u_duration
+                c_end = c_start + (chunk_char_len / total_chars) * u_duration
+                
+                raw_chunks.append({"start": c_start, "end": c_end, "text": chunk_text})
+                
+                chunk_start_char_idx = char_counter
                 current_chunk_words = [word]
                 current_chunk_len = len(word)
             else:
                 current_chunk_words.append(word)
                 current_chunk_len += word_len
-            word_char_count += len(word) + 1
+            char_counter += len(word) + 1
 
         if current_chunk_words:
             chunk_text = " ".join(current_chunk_words)
-            c_duration = (len(chunk_text) / total_chars) * u_duration
-            c_start = u["start"] + chunk_start_ratio * u_duration - best_start
-            c_end = c_start + c_duration
-            raw_chunks.append({"start": max(0.0, c_start), "end": max(c_start + 0.3, c_end), "text": chunk_text})
+            chunk_char_len = len(chunk_text)
+            c_start = u_start + (chunk_start_char_idx / total_chars) * u_duration
+            c_end = u_start + u_duration
+            raw_chunks.append({"start": c_start, "end": c_end, "text": chunk_text})
 
     chunked_subtitles = []
     for i, rc in enumerate(raw_chunks):
@@ -247,7 +251,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             if end_t > next_start:
                 end_t = next_start
         if end_t <= start_t:
-            end_t = start_t + 0.3
+            end_t = start_t + 0.15
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
     # 4. Download exact window via yt-dlp
@@ -272,7 +276,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 5. Render vertical clip + Character-based drawtext subtitles
+    # 5. Render vertical clip + Proportional drawtext subtitles
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
