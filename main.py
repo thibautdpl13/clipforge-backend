@@ -75,7 +75,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract subtitles: Try manual human-written subs first, fall back to auto-subs if needed
+    # 1. Extract subtitles: Manual human-written first, fallback to auto-subs
     sub_cmd_manual = [
         "yt-dlp",
         "--remote-components", "ejs:github",
@@ -102,7 +102,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     try:
         subprocess.run(sub_cmd_manual, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError:
-        pass # Fallback to auto-subs if manual subs aren't available
+        pass
 
     sub_files = glob.glob("/tmp/sub.*.json3")
     if not sub_files:
@@ -136,28 +136,22 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         base_start = start_ms / 1000.0
         total_event_duration = duration_ms / 1000.0
         
-        # If segs contain granular word data, parse each word with its offset
         if segs:
             seg_count = len(segs)
             time_per_seg = total_event_duration / max(1, seg_count)
             for idx, seg in enumerate(segs):
-                w_text = seg.get("utf8", "").strip()
+                w_text = seg.get("utf8", "").replace("-", "").strip()
                 if w_text and w_text != "\n":
                     w_start = base_start + (idx * time_per_seg)
                     w_end = w_start + time_per_seg
                     word_timed_list.append({"start": w_start, "end": w_end, "text": w_text})
         else:
-            # Fallback event text
-            ev_text = "".join(seg.get("utf8", "") for seg in segs).strip()
+            ev_text = "".join(seg.get("utf8", "") for seg in segs).replace("-", "").strip()
             if ev_text and ev_text != "\n":
                 word_timed_list.append({"start": base_start, "end": base_start + total_event_duration, "text": ev_text})
 
     if not word_timed_list:
         raise HTTPException(status_code=400, detail="Transcript analysis failed: Subtitles are empty.")
-
-    # Reconstruct utterances from word-level list for viral scoring
-    utterances = [{"start": word_timed_list[0]["start"], "end": word_timed_list[-1]["end"], "text": " ".join(w["text"] for w in word_timed_list)}]
-    total_video_duration = word_timed_list[-1]["end"]
 
     # 3. Viral Hook & Continuous Window Scoring Engine
     best_start = None
@@ -202,7 +196,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 4. Precision Character-Based Chunking (~22 characters per card, perfectly synced to word timestamps)
+    # 4. Precision Character-Based Chunking with Linger / No Gaps
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -225,11 +219,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             chunk_start_time = w["start"] - best_start
             
         if current_chars + len(w_text) + 1 > MAX_CHARS_PER_LINE and current_chunk_words:
-            # Flush current chunk
             chunk_text = " ".join(current_chunk_words)
             raw_chunks.append({
                 "start": max(0.0, chunk_start_time),
-                "end": max(chunk_start_time + 0.2, chunk_end_time),
+                "end": max(chunk_start_time + 0.3, chunk_end_time),
                 "text": chunk_text
             })
             current_chunk_words = [w_text]
@@ -245,21 +238,21 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         chunk_text = " ".join(current_chunk_words)
         raw_chunks.append({
             "start": max(0.0, chunk_start_time),
-            "end": max(chunk_start_time + 0.2, chunk_end_time),
+            "end": max(chunk_start_time + 0.3, chunk_end_time),
             "text": chunk_text
         })
 
-    # Enforce strict non-overlapping timeline
+    # Continuous display: Let previous subtitle linger until the next one starts (Zero gaps)
     chunked_subtitles = []
     for i, rc in enumerate(raw_chunks):
         start_t = rc["start"]
         end_t = rc["end"]
         if i + 1 < len(raw_chunks):
             next_start = raw_chunks[i + 1]["start"]
-            if end_t > next_start:
-                end_t = next_start
-        if end_t <= start_t:
-            end_t = start_t + 0.2
+            end_t = next_start  # Linger until next text starts
+        else:
+            end_t = rc["end"] + 1.0  # Linger final chunk slightly
+            
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
     # 5. Download exact window via yt-dlp
@@ -284,7 +277,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 6. Render vertical clip + True word-level synced drawtext subtitles
+    # 6. Render vertical clip + Asap Bold font, drop shadow, and continuous subtitle display
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -294,9 +287,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%")
         draw_filter = (
             f"drawtext=text='{safe_text}':"
-            f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"fontfile=/usr/share/fonts/truetype/asap/Asap-Bold.ttf:"
             f"fontsize=55:fontcolor=white:"
             f"borderw=4:bordercolor=black:"
+            f"shadowx=3:shadowy=3:shadowcolor=black@0.8:"
             f"x=(w-text_w)/2:y=1180:"
             f"enable='between(t,{sub['start']},{sub['end']})'"
         )
