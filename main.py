@@ -288,11 +288,36 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_filter = ",".join(vf_filters)
 
----
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-i", raw_video_path,
+        "-vf", video_filter,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        "-threads", "1",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        output_path
+    ]
 
-### Terminal Commands to Push
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        ff_err = e.stderr.decode('utf-8', errors='ignore')
+        raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[:300]}")
 
-```bash
-git add main.py
-git commit -m "Add mweb,android,web extractor args to yt-dlp to bypass empty subtitle stream responses"
-git push origin main
+    if not os.path.exists(output_path):
+        raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
+
+    def cleanup():
+        for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path, srt_path]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+    background_tasks.add_task(cleanup)
+
+    return FileResponse(output_path, media_type="video/mp4", filename="clip.mp4")
