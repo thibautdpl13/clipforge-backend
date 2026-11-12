@@ -60,15 +60,15 @@ def is_clean_start(utterances, idx):
     gap = utterances[idx]["start"] - utterances[idx - 1]["end"]
     return prev_ended or gap >= 0.6
 
-# Viral Hook keywords that signal high-engagement opening lines
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen"}
 
 @app.post("/generate-auto-clip")
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
+    srt_path = "/tmp/clip_subs.srt"
 
-    for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path]:
+    for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path, srt_path]:
         if os.path.exists(f):
             try:
                 os.remove(f)
@@ -137,7 +137,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         if not is_clean_start(utterances, i):
             continue
 
-        # Check for hook words or questions right at the start of the clip window
         first_text_lower = start_utt["text"].lower()
         has_hook = any(hw in first_text_lower for hw in HOOK_WORDS) or "?" in first_text_lower
         start_bonus = 1.4 if has_hook else 0.9
@@ -160,13 +159,8 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             if not is_clean_ending(utterances, j):
                 continue
 
-            # Density & Energy calculation
             density = char_count / length
-            
-            # Reward exclamation marks and question marks inside the window (indicates high energy / debate)
             punctuation_bonus = 1.0 + (min(full_window_text.count("?") + full_window_text.count("!"), 6) * 0.04)
-
-            # Position penalty: Avoid extreme intro / outro fluff
             position_ratio = win_start / total_video_duration
             pos_multiplier = 0.4 if (position_ratio < 0.03 or position_ratio > 0.97) else 1.0
 
@@ -185,7 +179,28 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 180.0, best_end + 0.4), 2)
 
-    # 3. Download exact dynamically sized window via yt-dlp using cookies and remote EJS components
+    # 3. Generate precise SRT subtitle file for this exact clip window
+    clip_utterances = [
+        u for u in utterances 
+        if u["end"] > best_start and u["start"] < best_end
+    ]
+
+    def fmt_time(seconds):
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        ms = int((seconds - int(seconds)) * 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for idx, u in enumerate(clip_utterances, 1):
+            s_start = max(0.0, u["start"] - best_start)
+            s_end = u["end"] - best_start
+            if s_end <= s_start:
+                s_end = s_start + 0.5
+            f.write(f"{idx}\n{fmt_time(s_start)} --> {fmt_time(s_end)}\n{u['text'].strip()}\n\n")
+
+    # 4. Download exact dynamically sized window via yt-dlp using cookies
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
@@ -207,11 +222,15 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 4. Render vertical clip via FFmpeg: Solid black letterboxing
+    # 5. Render vertical clip + Burn-in Auto Subtitles via FFmpeg
+    # Styles: Bright yellow text, bold black outline, centered near the bottom
+    subtitles_filter = f"subtitles={srt_path}:force_style='FontSize=28,PrimaryColour=&H00FFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2,Alignment=2,MarginV=150'"
+    video_filter = f"scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,{subtitles_filter}"
+
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-i", raw_video_path,
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black",
+        "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "28",
@@ -224,13 +243,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     try:
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        raise HTTPException(status_code=500, detail=f"FFmpeg subtitle burning failed: {e.stderr.decode('utf-8', errors='ignore')}")
 
     if not os.path.exists(output_path):
         raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
 
     def cleanup():
-        for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path]:
+        for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path, srt_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
