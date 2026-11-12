@@ -68,24 +68,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Fetch transcript using the updated YouTubeTranscriptApi instance fetch method
+    # 1. Fetch transcript using classic stable get_transcript method
     try:
-        ytt_api = YouTubeTranscriptApi()
-        fetched_data = ytt_api.fetch(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt', 'ru', 'ja', 'ko'])
-        transcript_list = [
-            {"start": entry.start, "duration": entry.duration, "text": entry.text}
-            for entry in fetched_data
-        ]
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt', 'ru', 'ja', 'ko'])
     except Exception as e:
         try:
-            # Fallback handler via transcript list search
-            transcript_list_obj = YouTubeTranscriptApi.list_transcripts(video_id)
-            transcript = transcript_list_obj.find_generated_transcript(['en', 'fr', 'es', 'de', 'it', 'pt'])
-            fetched_data = transcript.fetch()
-            transcript_list = [
-                {"start": entry.start, "duration": entry.duration, "text": entry.text}
-                for entry in fetched_data
-            ]
+            # Fallback to any available transcript language
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
         except Exception as inner_e:
             raise HTTPException(status_code=400, detail=f"Transcript extraction failed: No captions available. ({str(inner_e)})")
 
