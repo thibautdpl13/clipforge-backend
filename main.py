@@ -1,17 +1,16 @@
 import os
 import subprocess
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-import yt_dlp
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 app = FastAPI()
 
-# Allow requests from your GitHub Pages frontend and local testing
+# Enable CORS for your GitHub Pages frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows all origins (or restrict to your GitHub Pages URL)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -19,78 +18,74 @@ app.add_middleware(
 
 class ClipRequest(BaseModel):
     url: str
+    start_time: int = 0  # Default start time in seconds
+    duration: int = 30   # Default duration of clip in seconds
 
-def download_and_process_video(video_url: str, output_path: str):
-    """
-    Downloads the YouTube video using yt-dlp with cookie authentication 
-    and browser headers, then applies the foolproof FFmpeg vertical crop pipeline.
-    """
-    raw_download_path = "/tmp/raw_download.mp4"
-    
-    # Cleanup previous temp files
-    for p in [raw_download_path, output_path]:
-        if os.path.exists(p):
-            os.remove(p)
-
-    # yt-dlp configuration with cookies.txt and browser client bypasses
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=mp4]/best[ext=mp4]/best',
-        'outtmpl': raw_download_path,
-        'noplaylist': True,
-        'cookiefile': 'cookies.txt',  # Uses your cookies.txt in the backend root
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-        },
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}}
-    }
-
-    try:
-        # Step 1: Download video with yt-dlp
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
-
-        if not os.path.exists(raw_download_path):
-            raise Exception("yt-dlp failed to generate raw download file.")
-
-        # Step 2: Bulletproof FFmpeg vertical crop & scale command (avoids exit code 8 syntax errors)
-        ffmpeg_command = [
-            'ffmpeg', '-y', '-i', raw_download_path,
-            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-            '-c:v', 'libx264', '-preset', 'fast',
-            '-c:a', 'aac', '-b:a', '128k',
-            output_path
-        ]
-        
-        subprocess.run(ffmpeg_command, check=True)
-
-        # Fallback if processing didn't output the final path but raw download exists
-        if not os.path.exists(output_path) and os.path.exists(raw_download_path):
-            os.rename(raw_download_path, output_path)
-
-    except Exception as e:
-        raise Exception(f"Pipeline failure: {str(e)}")
+@app.get("/")
+def health_check():
+    return {"status": "running", "service": "ClipForge AI Backend"}
 
 @app.post("/generate-auto-clip")
-async def generate_auto_clip(payload: ClipRequest):
-    video_url = payload.url
-    if not video_url:
-        raise HTTPException(status_code=400, detail="URL is required")
+def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
+    raw_video_path = "/tmp/raw_download.mp4"
+    output_path = "/tmp/clip_output.mp4"
 
-    final_output_path = "/tmp/clip_output.mp4"
+    # Clean up any leftover files from previous requests
+    for path in [raw_video_path, output_path]:
+        if os.path.exists(path):
+            os.remove(path)
+
+    # 1. Download video section via yt-dlp using cookies if available
+    yt_dlp_cmd = [
+        "yt-dlp",
+        "--format", "best[ext=mp4]/best",
+        "--output", raw_video_path,
+    ]
+
+    # Include cookies.txt if present in the backend directory
+    if os.path.exists("cookies.txt"):
+        yt_dlp_cmd.extend(["--cookiefile", "cookies.txt"])
+
+    # Download specific section to save bandwidth and disk space
+    section_range = f"*{request.start_time}-{request.start_time + request.duration}"
+    yt_dlp_cmd.extend(["--download-sections", section_range, request.url])
 
     try:
-        download_and_process_video(video_url, final_output_path)
-        
-        if not os.path.exists(final_output_path):
-            raise HTTPException(status_code=500, detail="Processing completed, but output file is missing.")
+        subprocess.run(yt_dlp_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=400, detail=f"YouTube download failed: {e.stderr.decode('utf-8', errors='ignore')}")
 
-        return FileResponse(final_output_path, media_type="video/mp4", filename="clip.mp4")
+    if not os.path.exists(raw_video_path):
+        raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # 2. Render vertical clip via FFmpeg with strict RAM limits for Render's 512MB container
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-i", raw_video_path,
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",        # Keeps CPU/RAM buffer consumption extremely low
+        "-crf", "28",                  # Balanced file compression
+        "-threads", "1",               # CRITICAL: Prevents multi-thread OOM crashes on Render
+        "-c:a", "aac",
+        "-b:a", "128k",
+        output_path
+    ]
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    try:
+        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {e.stderr.decode('utf-8', errors='ignore')}")
+
+    if not os.path.exists(output_path):
+        raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
+
+    # Schedule cleanup of temp files after response is sent
+    def cleanup():
+        for path in [raw_video_path, output_path]:
+            if os.path.exists(path):
+                os.remove(path)
+
+    background_tasks.add_task(cleanup)
+
+    return FileResponse(output_path, media_type="video/mp4", filename="clip.mp4")
