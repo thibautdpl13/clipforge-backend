@@ -106,7 +106,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Native Python yt-dlp extraction for subtitles using authenticated cookies
+    # 1. Native Python yt-dlp extraction for subtitles using authenticated cookies and mweb client
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -114,7 +114,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['web']}},
+        'extractor_args': {'youtube': {'player_client': ['mweb', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_sub['cookiefile'] = COOKIES_PATH
@@ -235,13 +235,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using authenticated bv*+ba/b split streams and web client emulation
+    # 4. Download source video using flexible format fallback and mweb client emulation
     ydl_opts_video = {
-        'format': 'bv*+ba/b',
+        'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'extractor_args': {'youtube': {'player_client': ['web']}},
+        'extractor_args': {'youtube': {'player_client': ['mweb', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
@@ -303,7 +303,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         for f in glob.glob("/tmp/sub.*") + glob.glob("/tmp/raw_download.*") + [output_path]:
             if os.path.exists(f):
                 try:
-                    os.path.remove(f)
+                    os.remove(f)
                 except Exception:
                     pass
 
