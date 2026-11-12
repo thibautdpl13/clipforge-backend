@@ -15,5 +15,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# 2. Start FastAPI (Render injects PORT automatically)
-CMD ["uvicorn", "main:app", "host", "0.0.0.0", "port", "${PORT:-10000}"]
+# 2. Start FastAPI with proper uvicorn flag syntax
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
