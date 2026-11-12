@@ -105,7 +105,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Native Python yt-dlp extraction for subtitles using cookies and remote components JS solver
+    # 1. Native Python yt-dlp extraction for subtitles using iOS/Android client emulation to bypass challenges
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -113,8 +113,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
-        'remote_components': {'ejs': ['github']},
-        'extractor_args': {'youtube': {'player_client': ['mweb', 'web']}},
+        'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_sub['cookiefile'] = COOKIES_PATH
@@ -235,14 +234,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video with corrected remote components list format and fallback
+    # 4. Download source video using ios/android client emulation to bypass signature challenges completely
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'remote_components': {'ejs': ['github']},
-        'extractor_args': {'youtube': {'player_client': ['mweb', 'web']}},
+        'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
