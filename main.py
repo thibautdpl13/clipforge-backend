@@ -1,13 +1,13 @@
 import os
 import re
 import glob
-import json
 import subprocess
 from urllib.parse import urlparse, parse_qs
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from youtube_transcript_api import YouTubeTranscriptApi
 
 app = FastAPI()
 
@@ -38,27 +38,18 @@ class ClipRequest(BaseModel):
 def health_check():
     return {"status": "running", "service": "ClipForge AI Backend"}
 
-def is_clean_ending(utterances, idx):
-    text = utterances[idx]["text"].strip()
-    ends_with_punct = text.endswith((".", "!", "?"))
-    
-    has_pause = False
-    if idx + 1 < len(utterances):
-        gap = utterances[idx + 1]["start"] - utterances[idx]["end"]
-        if gap >= 0.5:
-            has_pause = True
-    else:
-        has_pause = True
-
-    return ends_with_punct or has_pause
-
-def is_clean_start(utterances, idx):
-    if idx == 0:
-        return True
-    prev_text = utterances[idx - 1]["text"].strip()
-    prev_ended = prev_text.endswith((".", "!", "?"))
-    gap = utterances[idx]["start"] - utterances[idx - 1]["end"]
-    return prev_ended or gap >= 0.5
+def extract_video_id(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.hostname in ("youtu.be",):
+        return parsed.path.lstrip("/")
+    if parsed.hostname in ("www.youtube.com", "youtube.com"):
+        if parsed.path == "/watch":
+            return parse_qs(parsed.query).get("v", [None])[0]
+        elif parsed.path.startswith(("/embed/", "/v/")):
+            return parsed.path.split("/")[2]
+    # Fallback regex search
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
+    return match.group(1) if match else None
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -66,97 +57,51 @@ HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "n
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
-    srt_path = "/tmp/clip_subs.srt"
 
-    for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path, srt_path]:
+    for f in [raw_video_path, output_path]:
         if os.path.exists(f):
             try:
                 os.remove(f)
             except Exception:
                 pass
 
-    # 1. Extract subtitles: Manual human-written first, fallback to auto-subs
-    sub_cmd_manual = [
-        "yt-dlp",
-        "--remote-components", "ejs:github",
-        "--write-subs",
-        "--sub-format", "json3",
-        "--skip-download",
-        "--output", "/tmp/sub",
-        request.url
-    ]
-    sub_cmd_auto = [
-        "yt-dlp",
-        "--remote-components", "ejs:github",
-        "--write-auto-subs",
-        "--sub-format", "json3",
-        "--skip-download",
-        "--output", "/tmp/sub",
-        request.url
-    ]
+    vid = extract_video_id(request.url)
+    if not vid:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL provided.")
 
-    if os.path.exists(COOKIES_PATH):
-        sub_cmd_manual.extend(["--cookies", COOKIES_PATH])
-        sub_cmd_auto.extend(["--cookies", COOKIES_PATH])
-
+    # 1. Fetch transcript reliably via youtube-transcript-api
     try:
-        subprocess.run(sub_cmd_manual, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError:
-        pass
-
-    sub_files = glob.glob("/tmp/sub.*.json3")
-    if not sub_files:
-        try:
-            subprocess.run(sub_cmd_auto, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=400, detail=f"Transcript extraction failed: {e.stderr.decode('utf-8', errors='ignore')}")
-        sub_files = glob.glob("/tmp/sub.*.json3")
-
-    if not sub_files:
-        raise HTTPException(status_code=400, detail="Metadata analysis failed: No captions available for this video.")
-
-    try:
-        with open(sub_files[0], "r", encoding="utf-8") as f:
-            sub_data = json.load(f)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse transcript: {str(e)}")
-
-    events = sub_data.get("events", [])
-    
-    # 2. Extract precise word-level timestamps (preserving apostrophes, cleaning hyphens)
-    word_timed_list = []
-    for ev in events:
-        start_ms = ev.get("tStartMs")
-        duration_ms = ev.get("dDurationMs", 3000)
-        segs = ev.get("segs", [])
-        
-        if start_ms is None:
-            continue
-            
-        base_start = start_ms / 1000.0
-        total_event_duration = duration_ms / 1000.0
-        
-        if segs:
-            seg_count = len(segs)
-            time_per_seg = total_event_duration / max(1, seg_count)
-            for idx, seg in enumerate(segs):
-                w_text = seg.get("utf8", "")
-                if w_text == "-":
-                    continue
-                w_text = w_text.strip()
-                if w_text and w_text != "\n":
-                    w_start = base_start + (idx * time_per_seg)
-                    w_end = w_start + time_per_seg
-                    word_timed_list.append({"start": w_start, "end": w_end, "text": w_text})
+        # Try fetching transcript with cookies if available
+        if os.path.exists(COOKIES_PATH):
+            try:
+                raw_transcript = YouTubeTranscriptApi.get_transcript(vid, cookies=COOKIES_PATH)
+            except Exception:
+                raw_transcript = YouTubeTranscriptApi.get_transcript(vid)
         else:
-            ev_text = "".join(seg.get("utf8", "") for seg in segs).replace(" - ", " ").strip()
-            if ev_text and ev_text != "\n":
-                word_timed_list.append({"start": base_start, "end": base_start + total_event_duration, "text": ev_text})
+            raw_transcript = YouTubeTranscriptApi.get_transcript(vid)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Transcript extraction failed: {str(e)}")
 
-    if not word_timed_list:
+    if not raw_transcript:
         raise HTTPException(status_code=400, detail="Transcript analysis failed: Subtitles are empty.")
 
-    # 3. Viral Hook & Continuous Window Scoring Engine
+    # Normalize entries
+    word_timed_list = []
+    for entry in raw_transcript:
+        start = entry.get("start", 0.0)
+        duration = entry.get("duration", 2.0)
+        text = entry.get("text", "").replace("-", "").strip()
+        if text and text != "\n":
+            word_timed_list.append({
+                "start": start,
+                "end": start + duration,
+                "text": text
+            })
+
+    if not word_timed_list:
+        raise HTTPException(status_code=400, detail="Transcript analysis failed: No valid subtitle entries.")
+
+    # 2. Viral Hook & Continuous Window Scoring Engine
     best_start = None
     best_end = None
     highest_score = -1.0
@@ -199,10 +144,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 4. Precision Character-Based Chunking (~22 chars)
-    clip_words = [
-        w for w in word_timed_list 
-        if w["end"] > best_start and w["start"] < best_end
+    # 3. Precision Character-Based Chunking (~22 chars) relative to clip window
+    clip_entries = [
+        e for e in word_timed_list 
+        if e["end"] > best_start and e["start"] < best_end
     ]
 
     raw_chunks = []
@@ -213,29 +158,36 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     chunk_start_time = None
     chunk_end_time = None
 
-    for w in clip_words:
-        w_text = w["text"].strip().upper()
-        if not w_text:
-            continue
-            
-        if not current_chunk_words:
-            chunk_start_time = w["start"] - best_start
-            
-        if current_chars + len(w_text) + 1 > MAX_CHARS_PER_LINE and current_chunk_words:
-            chunk_text = " ".join(current_chunk_words)
-            raw_chunks.append({
-                "start": max(0.0, chunk_start_time),
-                "end": max(chunk_start_time + 0.2, chunk_end_time),
-                "text": chunk_text
-            })
-            current_chunk_words = [w_text]
-            current_chars = len(w_text)
-            chunk_start_time = w["start"] - best_start
-            chunk_end_time = w["end"] - best_start
-        else:
-            current_chunk_words.append(w_text)
-            current_chars += len(w_text) + 1
-            chunk_end_time = w["end"] - best_start
+    for entry in clip_entries:
+        words = entry["text"].split()
+        e_start = max(0.0, entry["start"] - best_start)
+        e_duration = max(0.2, (entry["end"] - entry["start"]) / max(1, len(words)))
+        
+        for idx, w_text in enumerate(words):
+            w_text = w_text.strip().upper()
+            if not w_text:
+                continue
+            w_start = e_start + (idx * e_duration)
+            w_end = w_start + e_duration
+
+            if not current_chunk_words:
+                chunk_start_time = w_start
+
+            if current_chars + len(w_text) + 1 > MAX_CHARS_PER_LINE and current_chunk_words:
+                chunk_text = " ".join(current_chunk_words)
+                raw_chunks.append({
+                    "start": max(0.0, chunk_start_time),
+                    "end": max(chunk_start_time + 0.2, chunk_end_time),
+                    "text": chunk_text
+                })
+                current_chunk_words = [w_text]
+                current_chars = len(w_text)
+                chunk_start_time = w_start
+                chunk_end_time = w_end
+            else:
+                current_chunk_words.append(w_text)
+                current_chars += len(w_text) + 1
+                chunk_end_time = w_end
 
     if current_chunk_words:
         chunk_text = " ".join(current_chunk_words)
@@ -245,7 +197,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             "text": chunk_text
         })
 
-    # 5. Strict 0-Buffer & Non-Overlapping Timeline Enforcement
+    # 4. Strict 0-Buffer & Non-Overlapping Timeline Enforcement
     raw_chunks.sort(key=lambda x: x["start"])
 
     chunked_subtitles = []
@@ -275,7 +227,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if chunked_subtitles:
         chunked_subtitles[-1]["end"] = round(chunked_subtitles[-1]["start"] + 1.5, 3)
 
-    # 6. Download exact window via yt-dlp
+    # 5. Download exact video window via yt-dlp
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
@@ -297,7 +249,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 7. Render vertical clip + Asap Black font, small shadow, zero overlap/zero buffer
+    # 6. Render vertical clip + Asap Black font, small shadow, zero overlap/zero buffer
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -340,7 +292,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
 
     def cleanup():
-        for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path, srt_path]:
+        for f in [raw_video_path, output_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
