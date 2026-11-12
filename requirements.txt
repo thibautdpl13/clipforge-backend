@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-yt-dlp>=2026.0.0
+https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
 pydantic
 python-multipart

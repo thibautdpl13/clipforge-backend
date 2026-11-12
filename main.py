@@ -105,7 +105,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Subtitle extraction using web client and cookies
+    # 1. Subtitle extraction using cookies and remote components JS challenge solver
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -113,6 +113,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
+        'remote_components': {'ejs': 'github'},
         'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
     }
     if os.path.exists(COOKIES_PATH):
@@ -234,12 +235,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download video using cookie-supported web clients and robust format fallback
+    # 4. Download video using latest yt-dlp master branch with remote components challenge solver
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
+        'remote_components': {'ejs': 'github'},
         'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
     }
     if os.path.exists(COOKIES_PATH):
