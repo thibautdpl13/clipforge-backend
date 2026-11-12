@@ -199,7 +199,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 4. Precision Character-Based Chunking
+    # 4. Precision Character-Based Chunking (~22 chars)
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -246,16 +246,14 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         })
 
     # 5. Strict 0-Buffer & Non-Overlapping Timeline Enforcement
-    # Sort raw chunks by start time to guarantee proper sequence
     raw_chunks.sort(key=lambda x: x["start"])
 
     chunked_subtitles = []
-    for i, rc in enumerate(raw_chunks):
+    for rc in raw_chunks:
         start_t = rc["start"]
         end_t = rc["end"]
         if end_t <= start_t:
             end_t = start_t + 0.3
-            
         chunked_subtitles.append({
             "start": start_t,
             "end": end_t,
@@ -268,10 +266,8 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         if next_start > chunked_subtitles[i]["start"]:
             chunked_subtitles[i]["end"] = next_start
         else:
-            # Prevent inversion if timestamps collide
             chunked_subtitles[i + 1]["start"] = chunked_subtitles[i]["end"]
 
-    # Final cleanup of rounding
     for sub in chunked_subtitles:
         sub["start"] = round(sub["start"], 3)
         sub["end"] = round(sub["end"], 3)
