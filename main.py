@@ -196,7 +196,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 4. Precision Character-Based Chunking with Linger / No Gaps
+    # 4. Precision Character-Based Chunking with Strict Contiguous Handover (Zero Overlap, Zero Gaps)
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -222,7 +222,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             chunk_text = " ".join(current_chunk_words)
             raw_chunks.append({
                 "start": max(0.0, chunk_start_time),
-                "end": max(chunk_start_time + 0.3, chunk_end_time),
+                "end": max(chunk_start_time + 0.2, chunk_end_time),
                 "text": chunk_text
             })
             current_chunk_words = [w_text]
@@ -238,18 +238,18 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         chunk_text = " ".join(current_chunk_words)
         raw_chunks.append({
             "start": max(0.0, chunk_start_time),
-            "end": max(chunk_start_time + 0.3, chunk_end_time),
+            "end": max(chunk_start_time + 0.2, chunk_end_time),
             "text": chunk_text
         })
 
-    # Continuous display: Let previous subtitle linger until the next one starts (Zero gaps)
+    # Strict contiguous handover: Each chunk ends exactly when the next one starts (Zero overlap, zero gaps)
     chunked_subtitles = []
     for i, rc in enumerate(raw_chunks):
         start_t = rc["start"]
         end_t = rc["end"]
         if i + 1 < len(raw_chunks):
             next_start = raw_chunks[i + 1]["start"]
-            end_t = next_start  # Linger until next text starts
+            end_t = next_start  # Hand over control instantly at next word start
         else:
             end_t = rc["end"] + 1.0  # Linger final chunk slightly
             
@@ -277,7 +277,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 6. Render vertical clip + Asap Bold font, drop shadow, and continuous subtitle display
+    # 6. Render vertical clip + Asap Extra Bold font, smaller shadow, and zero-overlap continuous display
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -287,10 +287,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%")
         draw_filter = (
             f"drawtext=text='{safe_text}':"
-            f"fontfile=/usr/share/fonts/truetype/asap/Asap-Bold.ttf:"
+            f"fontfile=/usr/share/fonts/truetype/asap/Asap-ExtraBold.ttf:"
             f"fontsize=55:fontcolor=white:"
             f"borderw=4:bordercolor=black:"
-            f"shadowx=3:shadowy=3:shadowcolor=black@0.8:"
+            f"shadowx=1:shadowy=1:shadowcolor=black@0.8:"
             f"x=(w-text_w)/2:y=1180:"
             f"enable='between(t,{sub['start']},{sub['end']})'"
         )
