@@ -7,8 +7,6 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
 app = FastAPI()
 
@@ -39,25 +37,60 @@ class ClipRequest(BaseModel):
 def health_check():
     return {"status": "running", "service": "ClipForge AI Backend"}
 
-def extract_video_id(url: str) -> str:
-    parsed_url = urlparse(url)
-    if parsed_url.hostname in ['youtu.be', 'www.youtu.be']:
-        return parsed_url.path[1:]
-    if parsed_url.hostname in ['youtube.com', 'www.youtube.com', 'm.youtube.com']:
-        if parsed_url.path == '/watch':
-            return parse_qs(parsed_url.query).get('v', [None])[0]
-        elif parsed_url.path.startswith(('/embed/', '/v/')):
-            return parsed_url.path.split('/')[2]
-    match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
-    if match:
-        return match.group(1)
-    raise HTTPException(status_code=400, detail="Invalid YouTube URL format.")
-
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
+
+def parse_vtt_file(vtt_path):
+    word_timed_list = []
+    if not os.path.exists(vtt_path):
+        return word_timed_list
+        
+    with open(vtt_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    def time_to_seconds(time_str):
+        parts = time_str.strip().split(':')
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s.replace(',', '.'))
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s.replace(',', '.'))
+        return 0.0
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "-->" in line:
+            parts = line.split("-->")
+            start_t = time_to_seconds(parts[0])
+            end_t = time_to_seconds(parts.split()[2])
+            
+            i += 1
+            text_lines = []
+            while i < len(lines) and lines[i].strip():
+                clean_line = re.sub(r'<[^>]*>', '', lines[i]).strip()
+                if clean_line:
+                    text_lines.append(clean_line)
+                i += 1
+            
+            full_text = " ".join(text_lines).replace("-", "").strip()
+            if full_text:
+                words = full_text.split()
+                duration = max(0.3, end_t - start_t)
+                time_per_word = duration / max(1, len(words))
+                for w_idx, word in enumerate(words):
+                    clean_word = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', word).strip()
+                    if clean_word:
+                        w_start = start_t + (w_idx * time_per_word)
+                        w_end = w_start + time_per_word
+                        word_timed_list.append({"start": w_start, "end": w_end, "text": clean_word})
+        else:
+            i += 1
+            
+    return word_timed_list
 
 @app.post("/generate-auto-clip")
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
-    video_id = extract_video_id(request.url)
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
 
@@ -68,39 +101,47 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Fetch transcript using classic stable get_transcript method
-    try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt', 'ru', 'ja', 'ko'])
-    except Exception as e:
-        try:
-            # Fallback to any available transcript language
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        except Exception as inner_e:
-            raise HTTPException(status_code=400, detail=f"Transcript extraction failed: No captions available. ({str(inner_e)})")
+    # 1. Extract subtitles using cookie-authenticated yt-dlp to bypass 429 bot blocks
+    sub_cmd_auto = [
+        "yt-dlp",
+        "--remote-components", "ejs:github",
+        "--write-auto-subs",
+        "--sub-format", "vtt",
+        "--skip-download",
+        "--output", "/tmp/sub",
+        request.url
+    ]
+    sub_cmd_manual = [
+        "yt-dlp",
+        "--remote-components", "ejs:github",
+        "--write-subs",
+        "--sub-format", "vtt",
+        "--skip-download",
+        "--output", "/tmp/sub",
+        request.url
+    ]
 
-    if not transcript_list:
-        raise HTTPException(status_code=400, detail="Transcript analysis failed: Retrieved captions are empty.")
+    if os.path.exists(COOKIES_PATH):
+        sub_cmd_auto.extend(["--cookies", COOKIES_PATH])
+        sub_cmd_manual.extend(["--cookies", COOKIES_PATH])
 
-    word_timed_list = []
-    for entry in transcript_list:
-        start = entry.get("start", 0.0)
-        duration = entry.get("duration", 2.0)
-        text = entry.get("text", "").replace("\n", " ").strip()
-        
-        if not text:
-            continue
-            
-        words = text.split()
-        time_per_word = duration / max(1, len(words))
-        for idx, word in enumerate(words):
-            clean_word = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', word).strip()
-            if clean_word:
-                w_start = start + (idx * time_per_word)
-                w_end = w_start + time_per_word
-                word_timed_list.append({"start": w_start, "end": w_end, "text": clean_word})
+    # Try automatic subs first, then manual subs
+    subprocess.run(sub_cmd_auto, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sub_files = glob.glob("/tmp/sub.*.vtt")
 
+    if not sub_files:
+        subprocess.run(sub_cmd_manual, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        sub_files = glob.glob("/tmp/sub.*.vtt")
+
+    if not sub_files:
+        raise HTTPException(
+            status_code=400, 
+            detail="Subtitle extraction failed (429 Rate Limited). Please update your YOUTUBE_COOKIES environment variable on Render with a fresh exported cookies.txt file."
+        )
+
+    word_timed_list = parse_vtt_file(sub_files[0])
     if not word_timed_list:
-        raise HTTPException(status_code=400, detail="Transcript analysis failed: Formatted word list is empty.")
+        raise HTTPException(status_code=400, detail="Transcript analysis failed: Subtitle file parsed empty.")
 
     # 2. Viral Hook & Continuous Window Scoring Engine
     best_start = None
@@ -203,7 +244,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download exact window via yt-dlp with Render-optimized resource limits
+    # 4. Download exact window via yt-dlp with authenticated cookies
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
