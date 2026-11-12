@@ -72,9 +72,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract auto-subtitles via yt-dlp using cookies and Deno runtime
+    # 1. Extract auto-subtitles via yt-dlp using cookies, Deno runtime, and remote EJS components
     sub_cmd = [
         "yt-dlp",
+        "--remote-components", "ejs:github",
         "--write-auto-subs",
         "--sub-format", "json3",
         "--skip-download",
@@ -160,10 +161,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 180.0, best_end + 0.4), 2)
 
-    # 3. Download exact dynamically sized window via yt-dlp using cookies
+    # 3. Download exact dynamically sized window via yt-dlp using cookies and remote EJS components
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
+        "--remote-components", "ejs:github",
         "--format", "best[ext=mp4]/best",
         "--download-sections", section_range,
         "--output", raw_video_path,
