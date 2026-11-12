@@ -102,7 +102,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Native Python yt-dlp extraction for subtitles
+    # 1. Native Python yt-dlp extraction for subtitles with explicit cookie authentication
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -230,12 +230,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Universal format selector to prevent any format-not-available errors
+    # 4. Use reliable 'best' format selector to download pre-merged stream cleanly
     ydl_opts_video = {
-        'format': 'best/bestvideo+bestaudio',
+        'format': 'best',
         'outtmpl': raw_video_path,
         'quiet': True,
-        'merge_output_format': 'mp4'
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
