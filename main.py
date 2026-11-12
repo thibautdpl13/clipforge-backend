@@ -23,7 +23,6 @@ COOKIES_PATH = "/tmp/cookies.txt"
 
 @app.on_event("startup")
 def startup_event():
-    # Automatically write cookies from Render environment variable on boot
     cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookie_content:
         with open(COOKIES_PATH, "w", encoding="utf-8") as f:
@@ -73,7 +72,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract auto-subtitles via yt-dlp using cookies
+    # 1. Extract auto-subtitles via yt-dlp using cookies and Deno runtime
     sub_cmd = [
         "yt-dlp",
         "--write-auto-subs",
