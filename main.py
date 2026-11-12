@@ -181,30 +181,39 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Subtitle Chunking (3-4 words per frame, uppercase)
+    # 3. Precision Subtitle Chunking (3 words per frame, strict non-overlapping timestamps)
     clip_utterances = [
         u for u in utterances 
         if u["end"] > best_start and u["start"] < best_end
     ]
 
-    chunked_subtitles = []
+    raw_chunks = []
     for u in clip_utterances:
         words = u["text"].strip().upper().split()
         if not words:
             continue
-        u_duration = max(0.4, u["end"] - u["start"])
+        u_duration = max(0.3, u["end"] - u["start"])
         word_duration = u_duration / len(words)
 
-        chunk_size = 4
+        chunk_size = 3
         for idx_w in range(0, len(words), chunk_size):
             chunk_words = words[idx_w:idx_w + chunk_size]
             chunk_text = " ".join(chunk_words)
             c_start = u["start"] + (idx_w * word_duration) - best_start
             c_end = c_start + (len(chunk_words) * word_duration)
-            
-            c_start = max(0.0, c_start)
-            c_end = max(c_start + 0.35, c_end)
-            chunked_subtitles.append({"start": c_start, "end": c_end, "text": chunk_text})
+            raw_chunks.append({"start": max(0.0, c_start), "end": max(c_start + 0.25, c_end), "text": chunk_text})
+
+    chunked_subtitles = []
+    for i, rc in enumerate(raw_chunks):
+        start_t = rc["start"]
+        end_t = rc["end"]
+        if i + 1 < len(raw_chunks):
+            next_start = raw_chunks[i + 1]["start"]
+            if end_t > next_start:
+                end_t = next_start
+        if end_t <= start_t:
+            end_t = start_t + 0.25
+        chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
     # 4. Download exact window via yt-dlp
     section_range = f"*{start_time}-{end_time}"
@@ -228,7 +237,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 5. Render vertical clip + Guaranteed Subtitles via FFmpeg drawtext filter
+    # 5. Render vertical clip + Perfectly positioned & sized drawtext subtitles
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -239,9 +248,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         draw_filter = (
             f"drawtext=text='{safe_text}':"
             f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-            f"fontsize=32:fontcolor=white:"
-            f"borderw=3:bordercolor=black:"
-            f"x=(w-text_w)/2:y=1920-650:"
+            f"fontsize=55:fontcolor=white:"
+            f"borderw=4:bordercolor=black:"
+            f"x=(w-text_w)/2:y=1180:"
             f"enable='between(t,{sub['start']},{sub['end']})'"
         )
         vf_filters.append(draw_filter)
