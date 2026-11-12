@@ -96,10 +96,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
+    # Use authenticated cookies to bypass PO token restriction entirely
     sub_cmd_manual = [
         "yt-dlp",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=web",
         "--write-subs",
         "--sub-format", "vtt",
         "--skip-download",
@@ -109,7 +109,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     sub_cmd_auto = [
         "yt-dlp",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=web",
         "--write-auto-subs",
         "--sub-format", "vtt",
         "--skip-download",
@@ -133,7 +132,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         if not sub_files:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Subtitle extraction failed (PO Token restriction): Manual Output: {manual_output[-300:]} | Auto Output: {auto_output[-300:]}"
+                detail=f"Subtitle extraction blocked by PO Token. Please update your YOUTUBE_COOKIES environment variable on Render with a fresh exported cookies.txt file from your browser. Manual: {manual_output[-200:]}"
             )
 
     try:
@@ -247,7 +246,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     yt_dlp_cmd = [
         "yt-dlp",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=web",
         "--format", "best[ext=mp4]/best",
         "--download-sections", section_range,
         "--output", raw_video_path,
