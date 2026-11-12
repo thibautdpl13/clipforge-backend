@@ -230,9 +230,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video robustly without range constraints
+    # 4. Universal format selector to prevent any format-not-available errors
     ydl_opts_video = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'best/bestvideo+bestaudio',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4'
@@ -246,7 +246,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"YouTube download failed: {str(e)}")
 
-    # Resolve downloaded file path (accounting for merged extensions)
     downloaded_files = glob.glob("/tmp/raw_download.*")
     if downloaded_files:
         actual_raw_video = downloaded_files[0]
