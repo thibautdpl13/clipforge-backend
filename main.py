@@ -239,10 +239,8 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 5. Render vertical clip + TikTok Style Subtitles via FFmpeg
-    # Styling: Bold uppercase white text, thick black outline, positioned in the middle-lower zone (MarginV=650)
-    subtitles_filter = f"subtitles={srt_path}:force_style='FontName=Arial,FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=3,Alignment=2,MarginV=650'"
-    video_filter = f"scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,{subtitles_filter}"
+    # 5. Render vertical clip + TikTok Style Subtitles (Applied LAST in filter chain)
+    video_filter = f"scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,subtitles={srt_path}:force_style='FontName=Arial,FontSize=28,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=3,Alignment=2,MarginV=650'"
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
