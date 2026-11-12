@@ -95,7 +95,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
 
-    for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path]:
+    for f in glob.glob("/tmp/sub.*") + glob.glob("/tmp/raw_download.*") + [output_path]:
         if os.path.exists(f):
             try:
                 os.remove(f)
@@ -230,10 +230,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download exact window via native yt-dlp Python API with robust format fallback
+    # 4. Download source video robustly without range constraints
     ydl_opts_video = {
-        'format': 'b/bv+ba/b',
-        'download_ranges': yt_dlp.utils.download_range_func(None, [(start_time, end_time)]),
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4'
@@ -247,15 +246,14 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"YouTube download failed: {str(e)}")
 
-    if not os.path.exists(raw_video_path):
-        # Check if output was saved with mkv/webm extension from merging
-        possible_files = glob.glob("/tmp/raw_download.*")
-        if possible_files:
-            raw_video_path = possible_files[0]
-        else:
-            raise HTTPException(status_code=500, detail="Failed to download video source.")
+    # Resolve downloaded file path (accounting for merged extensions)
+    downloaded_files = glob.glob("/tmp/raw_download.*")
+    if downloaded_files:
+        actual_raw_video = downloaded_files[0]
+    else:
+        raise HTTPException(status_code=500, detail="Failed to locate downloaded video source.")
 
-    # 5. Render vertical clip (1080x1920) + Asap Extra Bold font (size 55, y=1180, shadowx=1:shadowy=1)
+    # 5. Render vertical clip (1080x1920), slice exact duration via FFmpeg, and burn Asap Extra Bold subtitles
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -278,7 +276,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
-        "-i", raw_video_path,
+        "-ss", str(start_time),
+        "-to", str(end_time),
+        "-i", actual_raw_video,
         "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
