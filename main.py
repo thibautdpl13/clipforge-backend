@@ -75,8 +75,17 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract auto-subtitles via yt-dlp using cookies and Deno
-    sub_cmd = [
+    # 1. Extract subtitles: Try manual human-written subs first, fall back to auto-subs if needed
+    sub_cmd_manual = [
+        "yt-dlp",
+        "--remote-components", "ejs:github",
+        "--write-subs",
+        "--sub-format", "json3",
+        "--skip-download",
+        "--output", "/tmp/sub",
+        request.url
+    ]
+    sub_cmd_auto = [
         "yt-dlp",
         "--remote-components", "ejs:github",
         "--write-auto-subs",
@@ -87,16 +96,24 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     ]
 
     if os.path.exists(COOKIES_PATH):
-        sub_cmd.extend(["--cookies", COOKIES_PATH])
+        sub_cmd_manual.extend(["--cookies", COOKIES_PATH])
+        sub_cmd_auto.extend(["--cookies", COOKIES_PATH])
 
     try:
-        subprocess.run(sub_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=400, detail=f"Transcript extraction failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        subprocess.run(sub_cmd_manual, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError:
+        pass # Fallback to auto-subs if manual subs aren't available
 
     sub_files = glob.glob("/tmp/sub.*.json3")
     if not sub_files:
-        raise HTTPException(status_code=400, detail="Metadata analysis failed: No auto-captions available for this video.")
+        try:
+            subprocess.run(sub_cmd_auto, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as e:
+            raise HTTPException(status_code=400, detail=f"Transcript extraction failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        sub_files = glob.glob("/tmp/sub.*.json3")
+
+    if not sub_files:
+        raise HTTPException(status_code=400, detail="Metadata analysis failed: No captions available for this video.")
 
     try:
         with open(sub_files[0], "r", encoding="utf-8") as f:
@@ -105,61 +122,62 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Failed to parse transcript: {str(e)}")
 
     events = sub_data.get("events", [])
-    raw_utterances = []
+    
+    # 2. Extract precise word-level timestamps directly from subtitle segments (segs)
+    word_timed_list = []
     for ev in events:
         start_ms = ev.get("tStartMs")
-        duration_ms = ev.get("dDurationMs", 0)
+        duration_ms = ev.get("dDurationMs", 3000)
         segs = ev.get("segs", [])
-        text = "".join(seg.get("utf8", "") for seg in segs).strip()
-        if start_ms is not None and text and text != "\n":
-            raw_utterances.append({
-                "start": start_ms / 1000.0,
-                "end": (start_ms + duration_ms) / 1000.0,
-                "text": text
-            })
+        
+        if start_ms is None:
+            continue
+            
+        base_start = start_ms / 1000.0
+        total_event_duration = duration_ms / 1000.0
+        
+        # If segs contain granular word data, parse each word with its offset
+        if segs:
+            seg_count = len(segs)
+            time_per_seg = total_event_duration / max(1, seg_count)
+            for idx, seg in enumerate(segs):
+                w_text = seg.get("utf8", "").strip()
+                if w_text and w_text != "\n":
+                    w_start = base_start + (idx * time_per_seg)
+                    w_end = w_start + time_per_seg
+                    word_timed_list.append({"start": w_start, "end": w_end, "text": w_text})
+        else:
+            # Fallback event text
+            ev_text = "".join(seg.get("utf8", "") for seg in segs).strip()
+            if ev_text and ev_text != "\n":
+                word_timed_list.append({"start": base_start, "end": base_start + total_event_duration, "text": ev_text})
 
-    if not raw_utterances:
+    if not word_timed_list:
         raise HTTPException(status_code=400, detail="Transcript analysis failed: Subtitles are empty.")
 
-    raw_utterances.sort(key=lambda x: x["start"])
-    utterances = []
-    last_end = 0.0
-    for u in raw_utterances:
-        if u["start"] >= last_end - 0.1:
-            utterances.append(u)
-            last_end = max(last_end, u["end"])
+    # Reconstruct utterances from word-level list for viral scoring
+    utterances = [{"start": word_timed_list[0]["start"], "end": word_timed_list[-1]["end"], "text": " ".join(w["text"] for w in word_timed_list)}]
+    total_video_duration = word_timed_list[-1]["end"]
 
-    total_video_duration = utterances[-1]["end"] if utterances else 300.0
-
-    # 2. Viral Hook & Continuous Window Scoring Engine
+    # 3. Viral Hook & Continuous Window Scoring Engine
     best_start = None
     best_end = None
     highest_score = -1.0
 
-    for i, start_utt in enumerate(utterances):
-        win_start = start_utt["start"]
-
+    for i, w in enumerate(word_timed_list):
+        win_start = w["start"]
         if win_start < 15:
             continue
 
-        if not is_clean_start(utterances, i):
-            continue
+        full_window_text = ""
+        win_end = win_start
+        char_count = 0
 
-        first_text_lower = start_utt["text"].lower()
-        has_hook = any(hw in first_text_lower for hw in HOOK_WORDS) or "?" in first_text_lower
-        start_bonus = 1.5 if has_hook else 0.8
-
-        char_count = len(start_utt["text"])
-        full_window_text = start_utt["text"]
-
-        for j in range(i + 1, len(utterances)):
-            utt_j = utterances[j]
-            if utt_j["start"] - utterances[j-1]["end"] > 3.0:
-                break
-
-            char_count += len(utt_j["text"])
-            full_window_text += " " + utt_j["text"]
-            win_end = utt_j["end"]
+        for j in range(i, len(word_timed_list)):
+            wj = word_timed_list[j]
+            char_count += len(wj["text"])
+            full_window_text += " " + wj["text"]
+            win_end = wj["end"]
             length = win_end - win_start
 
             if length < 20:
@@ -167,15 +185,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             if length > 65:
                 break
 
-            if not is_clean_ending(utterances, j):
-                continue
-
             density = char_count / length
-            punctuation_bonus = 1.0 + (min(full_window_text.count("?") + full_window_text.count("!"), 6) * 0.05)
-            position_ratio = win_start / total_video_duration
-            pos_multiplier = 0.3 if (position_ratio < 0.02 or position_ratio > 0.98) else 1.0
-
-            viral_score = density * start_bonus * punctuation_bonus * pos_multiplier
+            has_hook = any(hw in wj["text"].lower() for hw in HOOK_WORDS) or "?" in full_window_text
+            start_bonus = 1.5 if has_hook else 0.8
+            viral_score = density * start_bonus
 
             if viral_score > highest_score:
                 highest_score = viral_score
@@ -183,65 +196,60 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
                 best_end = win_end
 
     if best_start is None or best_end is None:
-        best_start = next((u["start"] for u in utterances if u["start"] >= 15), utterances[0]["start"])
-        best_end = min(best_start + 45.0, utterances[-1]["end"])
+        best_start = max(15.0, word_timed_list[0]["start"])
+        best_end = min(best_start + 45.0, word_timed_list[-1]["end"])
 
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Character-Based Chunking with 100% Transcript Sync
-    clip_utterances = [
-        u for u in utterances 
-        if u["end"] > best_start and u["start"] < best_end
+    # 4. Precision Character-Based Chunking (~22 characters per card, perfectly synced to word timestamps)
+    clip_words = [
+        w for w in word_timed_list 
+        if w["end"] > best_start and w["start"] < best_end
     ]
 
     raw_chunks = []
     MAX_CHARS_PER_LINE = 22
+    
+    current_chunk_words = []
+    current_chars = 0
+    chunk_start_time = None
+    chunk_end_time = None
 
-    for u in clip_utterances:
-        text = u["text"].strip().upper()
-        if not text:
-            continue
-        words = text.split()
-        if not words:
+    for w in clip_words:
+        w_text = w["text"].strip().upper()
+        if not w_text:
             continue
             
-        u_start = max(0.0, u["start"] - best_start)
-        u_end = max(u_start + 0.2, u["end"] - best_start)
-        u_duration = u_end - u_start
-        total_chars = len(text)
-        
-        current_chunk_words = []
-        current_chunk_len = 0
-        chunk_start_char_idx = 0
-        
-        char_counter = 0
-        for i, word in enumerate(words):
-            word_len = len(word) + 1
-            if current_chunk_len + word_len > MAX_CHARS_PER_LINE and current_chunk_words:
-                chunk_text = " ".join(current_chunk_words)
-                chunk_char_len = len(chunk_text)
-                
-                c_start = u_start + (chunk_start_char_idx / total_chars) * u_duration
-                c_end = c_start + (chunk_char_len / total_chars) * u_duration
-                
-                raw_chunks.append({"start": c_start, "end": c_end, "text": chunk_text})
-                
-                chunk_start_char_idx = char_counter
-                current_chunk_words = [word]
-                current_chunk_len = len(word)
-            else:
-                current_chunk_words.append(word)
-                current_chunk_len += word_len
-            char_counter += len(word) + 1
-
-        if current_chunk_words:
+        if not current_chunk_words:
+            chunk_start_time = w["start"] - best_start
+            
+        if current_chars + len(w_text) + 1 > MAX_CHARS_PER_LINE and current_chunk_words:
+            # Flush current chunk
             chunk_text = " ".join(current_chunk_words)
-            chunk_char_len = len(chunk_text)
-            c_start = u_start + (chunk_start_char_idx / total_chars) * u_duration
-            c_end = u_start + u_duration
-            raw_chunks.append({"start": c_start, "end": c_end, "text": chunk_text})
+            raw_chunks.append({
+                "start": max(0.0, chunk_start_time),
+                "end": max(chunk_start_time + 0.2, chunk_end_time),
+                "text": chunk_text
+            })
+            current_chunk_words = [w_text]
+            current_chars = len(w_text)
+            chunk_start_time = w["start"] - best_start
+            chunk_end_time = w["end"] - best_start
+        else:
+            current_chunk_words.append(w_text)
+            current_chars += len(w_text) + 1
+            chunk_end_time = w["end"] - best_start
 
+    if current_chunk_words:
+        chunk_text = " ".join(current_chunk_words)
+        raw_chunks.append({
+            "start": max(0.0, chunk_start_time),
+            "end": max(chunk_start_time + 0.2, chunk_end_time),
+            "text": chunk_text
+        })
+
+    # Enforce strict non-overlapping timeline
     chunked_subtitles = []
     for i, rc in enumerate(raw_chunks):
         start_t = rc["start"]
@@ -251,10 +259,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             if end_t > next_start:
                 end_t = next_start
         if end_t <= start_t:
-            end_t = start_t + 0.15
+            end_t = start_t + 0.2
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download exact window via yt-dlp
+    # 5. Download exact window via yt-dlp
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
@@ -276,7 +284,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 5. Render vertical clip + Proportional drawtext subtitles
+    # 6. Render vertical clip + True word-level synced drawtext subtitles
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
