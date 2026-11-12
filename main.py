@@ -7,7 +7,8 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 
 app = FastAPI()
 
@@ -67,16 +68,26 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Fetch transcript robustly via youtube-transcript-api (bypasses yt-dlp PO token limitations on cloud IPs)
+    # 1. Fetch transcript using the updated YouTubeTranscriptApi instance fetch method
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt', 'ru', 'ja', 'ko'])
-    except (TranscriptsDisabled, NoTranscriptFound):
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id).find_generated_transcript(['en', 'fr', 'es', 'de', 'it', 'pt']).fetch()
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Transcript extraction failed: No captions available for this video. ({str(e)})")
+        ytt_api = YouTubeTranscriptApi()
+        fetched_data = ytt_api.fetch(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt', 'ru', 'ja', 'ko'])
+        transcript_list = [
+            {"start": entry.start, "duration": entry.duration, "text": entry.text}
+            for entry in fetched_data
+        ]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve transcript: {str(e)}")
+        try:
+            # Fallback handler via transcript list search
+            transcript_list_obj = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript = transcript_list_obj.find_generated_transcript(['en', 'fr', 'es', 'de', 'it', 'pt'])
+            fetched_data = transcript.fetch()
+            transcript_list = [
+                {"start": entry.start, "duration": entry.duration, "text": entry.text}
+                for entry in fetched_data
+            ]
+        except Exception as inner_e:
+            raise HTTPException(status_code=400, detail=f"Transcript extraction failed: No captions available. ({str(inner_e)})")
 
     if not transcript_list:
         raise HTTPException(status_code=400, detail="Transcript analysis failed: Retrieved captions are empty.")
