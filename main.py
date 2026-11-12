@@ -10,7 +10,7 @@ app = FastAPI()
 # Enable CORS for your GitHub Pages frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins (or restrict to your GitHub Pages URL)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -18,8 +18,8 @@ app.add_middleware(
 
 class ClipRequest(BaseModel):
     url: str
-    start_time: int = 0  # Default start time in seconds
-    duration: int = 30   # Default duration of clip in seconds
+    start_time: int = 0
+    duration: int = 30
 
 @app.get("/")
 def health_check():
@@ -42,9 +42,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         "--output", raw_video_path,
     ]
 
-    # Include cookies.txt if present in the backend directory
+    # Corrected flag: yt-dlp uses --cookies (plural)
     if os.path.exists("cookies.txt"):
-        yt_dlp_cmd.extend(["--cookiefile", "cookies.txt"])
+        yt_dlp_cmd.extend(["--cookies", "cookies.txt"])
 
     # Download specific section to save bandwidth and disk space
     section_range = f"*{request.start_time}-{request.start_time + request.duration}"
@@ -80,7 +80,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(output_path):
         raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
 
-    # Schedule cleanup of temp files after response is sent
     def cleanup():
         for path in [raw_video_path, output_path]:
             if os.path.exists(path):
