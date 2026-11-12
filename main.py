@@ -105,7 +105,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Native Python yt-dlp extraction for subtitles using iOS/Android client emulation to bypass challenges
+    # 1. Subtitle extraction using web client and cookies
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -113,7 +113,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
+        'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_sub['cookiefile'] = COOKIES_PATH
@@ -176,7 +176,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Character-Based Chunking with Strict Contiguous Handover (Zero Overlap, Zero Gaps)
+    # 3. Precision Character-Based Chunking
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -234,13 +234,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using ios/android client emulation to bypass signature challenges completely
+    # 4. Download video using cookie-supported web clients and robust format fallback
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
+        'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
@@ -257,7 +257,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     else:
         raise HTTPException(status_code=500, detail="Failed to locate downloaded video source.")
 
-    # 5. Render vertical clip (1080x1920), slice exact duration via FFmpeg, and burn Asap Extra Bold subtitles
+    # 5. Render vertical clip (1080x1920) with Asap Extra Bold subtitles
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
