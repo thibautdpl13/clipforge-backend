@@ -31,9 +31,9 @@ def startup_event():
             
         with open(COOKIES_PATH, "w", encoding="utf-8") as f:
             f.write(cookie_content)
-        print("Successfully loaded and normalized YouTube cookies from environment variables.")
+        print(f"SUCCESS: Loaded cookies into {COOKIES_PATH}")
     else:
-        print("Warning: YOUTUBE_COOKIES environment variable not found.")
+        print("CRITICAL WARNING: YOUTUBE_COOKIES environment variable is missing or empty on Render!")
 
 class ClipRequest(BaseModel):
     url: str
@@ -106,7 +106,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Native Python yt-dlp extraction for subtitles with iOS/Web client emulation
+    # 1. Native Python yt-dlp extraction for subtitles using authenticated cookies
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -114,7 +114,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['ios', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_sub['cookiefile'] = COOKIES_PATH
@@ -235,13 +234,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using format_sort instead of a rigid format string (prevents missing format crashes)
+    # 4. Download source video using clean authenticated browser session defaults
     ydl_opts_video = {
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'format_sort': ['vcodec:h264', 'quality', 'res', 'fps', 'acodec:aac'],
-        'extractor_args': {'youtube': {'player_client': ['ios', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
