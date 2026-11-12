@@ -40,7 +40,6 @@ def health_check():
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
 def parse_vtt_file(vtt_path):
-    """Parses standard VTT subtitle files into word-timed list."""
     word_timed_list = []
     with open(vtt_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
@@ -63,11 +62,10 @@ def parse_vtt_file(vtt_path):
             start_t = time_to_seconds(parts[0])
             end_t = time_to_seconds(parts.split()[2])
             
-            # Gather subtitle text lines until empty line
             i += 1
             text_lines = []
             while i < len(lines) and lines[i].strip():
-                clean_line = re.sub(r'<[^>]*>', '', lines[i]).strip() # remove HTML tags if any
+                clean_line = re.sub(r'<[^>]*>', '', lines[i]).strip()
                 if clean_line:
                     text_lines.append(clean_line)
                 i += 1
@@ -98,11 +96,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract subtitles using standard VTT format
     sub_cmd_manual = [
         "yt-dlp",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=mweb,android,web",
+        "--extractor-args", "youtube:player_client=web",
         "--write-subs",
         "--sub-format", "vtt",
         "--skip-download",
@@ -112,7 +109,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     sub_cmd_auto = [
         "yt-dlp",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=mweb,android,web",
+        "--extractor-args", "youtube:player_client=web",
         "--write-auto-subs",
         "--sub-format", "vtt",
         "--skip-download",
@@ -124,13 +121,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         sub_cmd_manual.extend(["--cookies", COOKIES_PATH])
         sub_cmd_auto.extend(["--cookies", COOKIES_PATH])
 
-    # Run manual subs
     res_manual = subprocess.run(sub_cmd_manual, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     manual_output = res_manual.stderr.decode('utf-8', errors='ignore')
 
     sub_files = glob.glob("/tmp/sub.*.vtt")
     if not sub_files:
-        # Run auto subs
         res_auto = subprocess.run(sub_cmd_auto, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         auto_output = res_auto.stderr.decode('utf-8', errors='ignore')
         sub_files = glob.glob("/tmp/sub.*.vtt")
@@ -138,7 +133,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         if not sub_files:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Subtitle extraction failed. Manual Output: {manual_output[-300:]} | Auto Output: {auto_output[-300:]}"
+                detail=f"Subtitle extraction failed (PO Token restriction): Manual Output: {manual_output[-300:]} | Auto Output: {auto_output[-300:]}"
             )
 
     try:
@@ -149,7 +144,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not word_timed_list:
         raise HTTPException(status_code=400, detail="Transcript analysis failed: Parsed subtitles are empty.")
 
-    # 2. Viral Hook & Continuous Window Scoring Engine
     best_start = None
     best_end = None
     highest_score = -1.0
@@ -192,7 +186,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Character-Based Chunking with Strict Contiguous Handover (Zero Overlap, Zero Gaps)
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -250,12 +243,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download exact window via yt-dlp
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=mweb,android,web",
+        "--extractor-args", "youtube:player_client=web",
         "--format", "best[ext=mp4]/best",
         "--download-sections", section_range,
         "--output", raw_video_path,
@@ -270,7 +262,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         dl_err = dl_res.stderr.decode('utf-8', errors='ignore')
         raise HTTPException(status_code=400, detail=f"YouTube download failed: {dl_err[-300:]}")
 
-    # 5. Render vertical clip + Asap Extra Bold font, smaller shadow, and zero-overlap continuous display
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
