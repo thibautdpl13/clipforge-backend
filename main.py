@@ -114,6 +114,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
+        'extractor_args': {'youtube': {'player_client': ['web']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_sub['cookiefile'] = COOKIES_PATH
@@ -234,12 +235,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using flexible format sorting to avoid strict manifest blocks
+    # 4. Download source video using authenticated bv*+ba/b split streams and web client emulation
     ydl_opts_video = {
-        'format': 'best',
+        'format': 'bv*+ba/b',
         'outtmpl': raw_video_path,
         'quiet': True,
-        'format_sort': ['res:1080', 'ext:mp4', 'codec:h264'],
+        'merge_output_format': 'mp4',
+        'extractor_args': {'youtube': {'player_client': ['web']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
@@ -301,7 +303,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         for f in glob.glob("/tmp/sub.*") + glob.glob("/tmp/raw_download.*") + [output_path]:
             if os.path.exists(f):
                 try:
-                    os.remove(f)
+                    os.path.remove(f)
                 except Exception:
                     pass
 
