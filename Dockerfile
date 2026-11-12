@@ -1,23 +1,24 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
-# Install FFmpeg, curl, unzip, and Deno (the native JS runtime required by yt-dlp)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system dependencies: Node.js (for yt-dlp n-challenge decryption), FFmpeg, and curl/git
+RUN apt-get update && apt-get install -y \
+    nodejs \
+    npm \
     ffmpeg \
-    curl \
-    unzip \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://deno.land/install.sh | sh
-
-# Add Deno to system PATH
-ENV PATH="/root/.deno/bin:${PATH}"
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Copy requirements and install python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy application source code
 COPY . .
 
-# Start FastAPI
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Expose Render's default port
+EXPOSE 10000
+
+# Start FastAPI server using Uvicorn
+CMD ["uvicorn", "main.py:app", "--host", "0.0.0.0", "--port", "10000"]
