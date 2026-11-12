@@ -1,12 +1,13 @@
 import os
 import re
+import glob
+import json
 import subprocess
 from urllib.parse import urlparse, parse_qs
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
 
 app = FastAPI()
 
@@ -25,33 +26,11 @@ class ClipRequest(BaseModel):
 def health_check():
     return {"status": "running", "service": "ClipForge AI Backend"}
 
-def extract_video_id(url: str) -> str:
-    """Extracts the 11-character YouTube video ID from standard, short, embed, live, or shorts URLs."""
-    parsed = urlparse(url.strip())
-    if parsed.hostname in ("youtu.be", "www.youtu.be"):
-        vid = parsed.path.lstrip("/").split("/")[0]
-        if len(vid) == 11:
-            return vid
-    if parsed.hostname in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"):
-        if parsed.path == "/watch":
-            qs = parse_qs(parsed.query)
-            if "v" in qs and len(qs["v"][0]) == 11:
-                return qs["v"][0]
-        for prefix in ("/shorts/", "/embed/", "/live/", "/v/"):
-            if parsed.path.startswith(prefix):
-                vid = parsed.path[len(prefix):].split("/")[0]
-                if len(vid) == 11:
-                    return vid
-    match = re.search(r"(?:v=|\/|youtu\.be\/)([0-9A-Za-z_-]{11})(?:[&?\/]|$)", url)
-    if match:
-        return match.group(1)
-    raise ValueError("Invalid YouTube URL: could not extract 11-character video ID.")
-
 def is_clean_ending(utterances, idx):
     """Checks if utterance at idx ends a complete sentence or has a natural speech pause after it."""
     text = utterances[idx]["text"].strip()
     ends_with_punct = text.endswith((".", "!", "?"))
-
+    
     has_pause = False
     if idx + 1 < len(utterances):
         gap = utterances[idx + 1]["start"] - utterances[idx]["end"]
@@ -76,44 +55,52 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
 
-    for f in [raw_video_path, output_path]:
+    for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path]:
         if os.path.exists(f):
             try:
                 os.remove(f)
             except Exception:
                 pass
 
-    # 1. Extract Video ID and fetch transcript directly via youtube-transcript-api (zero cookies)
-    try:
-        video_id = extract_video_id(request.url)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    # 1. Extract auto-subtitles via yt-dlp + local Rust PO Token server (bypasses cloud IP block)
+    sub_cmd = [
+        "yt-dlp",
+        "--write-auto-subs",
+        "--sub-format", "json3",
+        "--skip-download",
+        "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+        "--output", "/tmp/sub",
+        request.url
+    ]
 
     try:
-        ytt_api = YouTubeTranscriptApi()
-        transcript_list = ytt_api.list(video_id)
-        try:
-            transcript_obj = transcript_list.find_transcript(["en", "en-US", "en-GB"])
-        except Exception:
-            transcript_obj = next(iter(transcript_list))
-        fetched_snippets = transcript_obj.fetch()
+        subprocess.run(sub_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=400, detail=f"Transcript extraction failed: {e.stderr.decode('utf-8', errors='ignore')}")
+
+    sub_files = glob.glob("/tmp/sub.*.json3")
+    if not sub_files:
+        raise HTTPException(status_code=400, detail="Transcript analysis failed: No auto-captions available for this video.")
+
+    try:
+        with open(sub_files[0], "r", encoding="utf-8") as f:
+            sub_data = json.load(f)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Transcript extraction failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse transcript: {str(e)}")
 
+    events = sub_data.get("events", [])
     utterances = []
-    for item in fetched_snippets:
-        text = getattr(item, "text", None) if not isinstance(item, dict) else item.get("text")
-        start = getattr(item, "start", None) if not isinstance(item, dict) else item.get("start")
-        duration = getattr(item, "duration", 0.0) if not isinstance(item, dict) else item.get("duration", 0.0)
-
-        if text is not None and start is not None:
-            clean_text = text.replace("\n", " ").strip()
-            if clean_text:
-                utterances.append({
-                    "start": float(start),
-                    "end": float(start) + float(duration),
-                    "text": clean_text
-                })
+    for ev in events:
+        start_ms = ev.get("tStartMs")
+        duration_ms = ev.get("dDurationMs", 0)
+        segs = ev.get("segs", [])
+        text = "".join(seg.get("utf8", "") for seg in segs).strip()
+        if start_ms is not None and text and text != "\n":
+            utterances.append({
+                "start": start_ms / 1000.0,
+                "end": (start_ms + duration_ms) / 1000.0,
+                "text": text
+            })
 
     if not utterances:
         raise HTTPException(status_code=400, detail="Transcript analysis failed: Subtitles are empty.")
@@ -161,7 +148,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 180.0, best_end + 0.4), 2)
 
-    # 3. Download exact dynamically sized window via yt-dlp + local Rust PO Token server (zero cookies)
+    # 3. Download exact dynamically sized window via yt-dlp + PO token server
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
@@ -203,7 +190,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
 
     def cleanup():
-        for f in [raw_video_path, output_path]:
+        for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
