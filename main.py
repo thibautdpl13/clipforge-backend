@@ -96,13 +96,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # Use clean subtitle extraction args without conflicting format restrictions
     sub_cmd_manual = [
         "yt-dlp",
         "--remote-components", "ejs:github",
         "--write-subs",
         "--sub-format", "vtt",
         "--skip-download",
+        "--no-check-certificates",
         "--output", "/tmp/sub",
         request.url
     ]
@@ -112,6 +112,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         "--write-auto-subs",
         "--sub-format", "vtt",
         "--skip-download",
+        "--no-check-certificates",
         "--output", "/tmp/sub",
         request.url
     ]
