@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 
 app = FastAPI()
 
@@ -37,55 +38,25 @@ class ClipRequest(BaseModel):
 def health_check():
     return {"status": "running", "service": "ClipForge AI Backend"}
 
+def extract_video_id(url: str) -> str:
+    parsed_url = urlparse(url)
+    if parsed_url.hostname in ['youtu.be', 'www.youtu.be']:
+        return parsed_url.path[1:]
+    if parsed_url.hostname in ['youtube.com', 'www.youtube.com', 'm.youtube.com']:
+        if parsed_url.path == '/watch':
+            return parse_qs(parsed_url.query).get('v', [None])[0]
+        elif parsed_url.path.startswith(('/embed/', '/v/')):
+            return parsed_url.path.split('/')[2]
+    match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
+    if match:
+        return match.group(1)
+    raise HTTPException(status_code=400, detail="Invalid YouTube URL format.")
+
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
-
-def parse_vtt_file(vtt_path):
-    word_timed_list = []
-    with open(vtt_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    def time_to_seconds(time_str):
-        parts = time_str.strip().split(':')
-        if len(parts) == 3:
-            h, m, s = parts
-            return int(h) * 3600 + int(m) * 60 + float(s.replace(',', '.'))
-        elif len(parts) == 2:
-            m, s = parts
-            return int(m) * 60 + float(s.replace(',', '.'))
-        return 0.0
-
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if "-->" in line:
-            parts = line.split("-->")
-            start_t = time_to_seconds(parts[0])
-            end_t = time_to_seconds(parts.split()[2])
-            
-            i += 1
-            text_lines = []
-            while i < len(lines) and lines[i].strip():
-                clean_line = re.sub(r'<[^>]*>', '', lines[i]).strip()
-                if clean_line:
-                    text_lines.append(clean_line)
-                i += 1
-            
-            full_text = " ".join(text_lines).replace("-", "").strip()
-            if full_text:
-                words = full_text.split()
-                duration = max(0.3, end_t - start_t)
-                time_per_word = duration / max(1, len(words))
-                for w_idx, word in enumerate(words):
-                    w_start = start_t + (w_idx * time_per_word)
-                    w_end = w_start + time_per_word
-                    word_timed_list.append({"start": w_start, "end": w_end, "text": word})
-        else:
-            i += 1
-            
-    return word_timed_list
 
 @app.post("/generate-auto-clip")
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
+    video_id = extract_video_id(request.url)
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
 
@@ -96,61 +67,49 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    sub_cmd_manual = [
-        "yt-dlp",
-        "--remote-components", "ejs:github",
-        "--write-subs",
-        "--sub-format", "vtt",
-        "--skip-download",
-        "--no-check-certificates",
-        "--output", "/tmp/sub",
-        request.url
-    ]
-    sub_cmd_auto = [
-        "yt-dlp",
-        "--remote-components", "ejs:github",
-        "--write-auto-subs",
-        "--sub-format", "vtt",
-        "--skip-download",
-        "--no-check-certificates",
-        "--output", "/tmp/sub",
-        request.url
-    ]
-
-    if os.path.exists(COOKIES_PATH):
-        sub_cmd_manual.extend(["--cookies", COOKIES_PATH])
-        sub_cmd_auto.extend(["--cookies", COOKIES_PATH])
-
-    res_manual = subprocess.run(sub_cmd_manual, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    manual_output = res_manual.stderr.decode('utf-8', errors='ignore')
-
-    sub_files = glob.glob("/tmp/sub.*.vtt")
-    if not sub_files:
-        res_auto = subprocess.run(sub_cmd_auto, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        auto_output = res_auto.stderr.decode('utf-8', errors='ignore')
-        sub_files = glob.glob("/tmp/sub.*.vtt")
-
-        if not sub_files:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Subtitle extraction failed: Manual: {manual_output[-200:]} | Auto: {auto_output[-200:]}"
-            )
-
+    # 1. Fetch transcript robustly via youtube-transcript-api (bypasses yt-dlp PO token limitations on cloud IPs)
     try:
-        word_timed_list = parse_vtt_file(sub_files[0])
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt', 'ru', 'ja', 'ko'])
+    except (TranscriptsDisabled, NoTranscriptFound):
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id).find_generated_transcript(['en', 'fr', 'es', 'de', 'it', 'pt']).fetch()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Transcript extraction failed: No captions available for this video. ({str(e)})")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse subtitle file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve transcript: {str(e)}")
+
+    if not transcript_list:
+        raise HTTPException(status_code=400, detail="Transcript analysis failed: Retrieved captions are empty.")
+
+    word_timed_list = []
+    for entry in transcript_list:
+        start = entry.get("start", 0.0)
+        duration = entry.get("duration", 2.0)
+        text = entry.get("text", "").replace("\n", " ").strip()
+        
+        if not text:
+            continue
+            
+        words = text.split()
+        time_per_word = duration / max(1, len(words))
+        for idx, word in enumerate(words):
+            clean_word = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', word).strip()
+            if clean_word:
+                w_start = start + (idx * time_per_word)
+                w_end = w_start + time_per_word
+                word_timed_list.append({"start": w_start, "end": w_end, "text": clean_word})
 
     if not word_timed_list:
-        raise HTTPException(status_code=400, detail="Transcript analysis failed: Parsed subtitles are empty.")
+        raise HTTPException(status_code=400, detail="Transcript analysis failed: Formatted word list is empty.")
 
+    # 2. Viral Hook & Continuous Window Scoring Engine
     best_start = None
     best_end = None
     highest_score = -1.0
 
     for i, w in enumerate(word_timed_list):
         win_start = w["start"]
-        if win_start < 15:
+        if win_start < 10:
             continue
 
         full_window_text = ""
@@ -180,12 +139,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
                 best_end = win_end
 
     if best_start is None or best_end is None:
-        best_start = max(15.0, word_timed_list[0]["start"])
+        best_start = max(10.0, word_timed_list[0]["start"])
         best_end = min(best_start + 45.0, word_timed_list[-1]["end"])
 
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
+    # 3. Precision Character-Based Chunking with Strict Contiguous Handover (Zero Overlap, Zero Gaps)
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -239,10 +199,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             next_start = raw_chunks[i + 1]["start"]
             end_t = next_start
         else:
-            end_t = rc["end"] + 1.0
+            end_t = rc["end"] + 1.2
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
+    # 4. Download exact window via yt-dlp with Render-optimized resource limits
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
@@ -261,6 +222,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         dl_err = dl_res.stderr.decode('utf-8', errors='ignore')
         raise HTTPException(status_code=400, detail=f"YouTube download failed: {dl_err[-300:]}")
 
+    # 5. Render vertical clip (1080x1920) + Asap Extra Bold font (size 55, y=1180, shadowx=1:shadowy=1)
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"

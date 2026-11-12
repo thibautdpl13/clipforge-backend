@@ -1,4 +1,6 @@
 fastapi
 uvicorn
 yt-dlp
-requests
+youtube-transcript-api
+pydantic
+python-multipart
