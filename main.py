@@ -231,8 +231,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video with adaptive format selection and client emulation
+    # 4. Download source video with robust fallback format selector bv*+ba/b
     ydl_opts_video = {
+        'format': 'bv*+ba/b',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
