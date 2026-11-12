@@ -105,21 +105,29 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Failed to parse transcript: {str(e)}")
 
     events = sub_data.get("events", [])
-    utterances = []
+    raw_utterances = []
     for ev in events:
         start_ms = ev.get("tStartMs")
         duration_ms = ev.get("dDurationMs", 0)
         segs = ev.get("segs", [])
         text = "".join(seg.get("utf8", "") for seg in segs).strip()
         if start_ms is not None and text and text != "\n":
-            utterances.append({
+            raw_utterances.append({
                 "start": start_ms / 1000.0,
                 "end": (start_ms + duration_ms) / 1000.0,
                 "text": text
             })
 
-    if not utterances:
+    if not raw_utterances:
         raise HTTPException(status_code=400, detail="Transcript analysis failed: Subtitles are empty.")
+
+    raw_utterances.sort(key=lambda x: x["start"])
+    utterances = []
+    last_end = 0.0
+    for u in raw_utterances:
+        if u["start"] >= last_end - 0.1:
+            utterances.append(u)
+            last_end = max(last_end, u["end"])
 
     total_video_duration = utterances[-1]["end"] if utterances else 300.0
 
@@ -181,40 +189,65 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Subtitle Chunking with strict spacing and non-overlapping bounds
+    # 3. Precision Subtitle Chunking based on Character Count (~22 chars per card for optimal width)
     clip_utterances = [
         u for u in utterances 
         if u["end"] > best_start and u["start"] < best_end
     ]
 
     raw_chunks = []
+    MAX_CHARS_PER_LINE = 22
+
     for u in clip_utterances:
-        # Split individual words and clean them
-        words = u["text"].strip().upper().split()
+        text = u["text"].strip().upper()
+        if not text:
+            continue
+        words = text.split()
         if not words:
             continue
+            
         u_duration = max(0.3, u["end"] - u["start"])
-        word_duration = u_duration / len(words)
+        total_chars = len(text)
+        
+        current_chunk_words = []
+        current_chunk_len = 0
+        chunk_start_ratio = 0.0
+        
+        word_char_count = 0
+        for i, word in enumerate(words):
+            word_len = len(word) + 1
+            if current_chunk_len + word_len > MAX_CHARS_PER_LINE and current_chunk_words:
+                chunk_text = " ".join(current_chunk_words)
+                c_duration = (len(chunk_text) / total_chars) * u_duration
+                c_start = u["start"] + chunk_start_ratio * u_duration - best_start
+                c_end = c_start + c_duration
+                raw_chunks.append({"start": max(0.0, c_start), "end": max(c_start + 0.3, c_end), "text": chunk_text})
+                
+                chunk_start_ratio = word_char_count / total_chars
+                current_chunk_words = [word]
+                current_chunk_len = len(word)
+            else:
+                current_chunk_words.append(word)
+                current_chunk_len += word_len
+            word_char_count += len(word) + 1
 
-        chunk_size = 3
-        for idx_w in range(0, len(words), chunk_size):
-            chunk_words = words[idx_w:idx_w + chunk_size]
-            chunk_text = " ".join(chunk_words)  # Ensures proper spacing between words!
-            c_start = u["start"] + (idx_w * word_duration) - best_start
-            c_end = c_start + (len(chunk_words) * word_duration)
-            raw_chunks.append({"start": max(0.0, c_start), "end": max(c_start + 0.25, c_end), "text": chunk_text})
+        if current_chunk_words:
+            chunk_text = " ".join(current_chunk_words)
+            c_duration = (len(chunk_text) / total_chars) * u_duration
+            c_start = u["start"] + chunk_start_ratio * u_duration - best_start
+            c_end = c_start + c_duration
+            raw_chunks.append({"start": max(0.0, c_start), "end": max(c_start + 0.3, c_end), "text": chunk_text})
 
     chunked_subtitles = []
     for i, rc in enumerate(raw_chunks):
         start_t = rc["start"]
         end_t = rc["end"]
-        # Force end time to not overlap with the next chunk's start time
         if i + 1 < len(raw_chunks):
             next_start = raw_chunks[i + 1]["start"]
             if end_t > next_start:
                 end_t = next_start
         if end_t <= start_t:
-            end_t = start_t + 0.25
+            end_t = start_t + 0.3
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
     # 4. Download exact window via yt-dlp
@@ -239,7 +272,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 5. Render vertical clip + cleanly spaced drawtext subtitles
+    # 5. Render vertical clip + Character-based drawtext subtitles
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
