@@ -9,7 +9,6 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# Enable CORS for frontend communication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,12 +24,36 @@ class ClipRequest(BaseModel):
 def health_check():
     return {"status": "running", "service": "ClipForge AI Backend"}
 
+def is_clean_ending(utterances, idx):
+    """Checks if utterance at idx ends a complete sentence or has a natural speech pause after it."""
+    text = utterances[idx]["text"].strip()
+    ends_with_punct = text.endswith((".", "!", "?"))
+    
+    # Check if there is a natural breath/pause (>= 0.6s) before the next utterance
+    has_pause = False
+    if idx + 1 < len(utterances):
+        gap = utterances[idx + 1]["start"] - utterances[idx]["end"]
+        if gap >= 0.6:
+            has_pause = True
+    else:
+        has_pause = True
+
+    return ends_with_punct or has_pause
+
+def is_clean_start(utterances, idx):
+    """Checks if utterance at idx starts after a completed sentence or natural pause."""
+    if idx == 0:
+        return True
+    prev_text = utterances[idx - 1]["text"].strip()
+    prev_ended = prev_text.endswith((".", "!", "?"))
+    gap = utterances[idx]["start"] - utterances[idx - 1]["end"]
+    return prev_ended or gap >= 0.6
+
 @app.post("/generate-auto-clip")
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
 
-    # Cleanup any lingering temporary files
     for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path]:
         if os.path.exists(f):
             try:
@@ -38,7 +61,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except:
                 pass
 
-    # 1. Download auto-subtitles / transcript via yt-dlp for full AI analysis
+    # 1. Download auto-subtitles / transcript via yt-dlp
     sub_cmd = [
         "yt-dlp",
         "--write-auto-subs",
@@ -56,7 +79,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=400, detail=f"Transcript extraction failed: {e.stderr.decode('utf-8', errors='ignore')}")
 
-    # Locate generated subtitle file
     sub_files = glob.glob("/tmp/sub.*.json3")
     if not sub_files:
         raise HTTPException(status_code=400, detail="Metadata analysis failed: No auto-captions available for this video.")
@@ -84,39 +106,57 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not utterances:
         raise HTTPException(status_code=400, detail="Transcript analysis failed: Subtitles are empty.")
 
-    # 2. AI Transcript Window Scoring (Dynamic 15s to 180s range)
-    best_start = utterances[0]["start"]
-    best_end = best_start + 45  
-    highest_score = -1
+    # 2. Dynamic AI Window Scoring (15s to 180s, density-based, strict sentence boundaries)
+    best_start = None
+    best_end = None
+    highest_score = -1.0
 
     for i, start_utt in enumerate(utterances):
         win_start = start_utt["start"]
-        
-        # Avoid opening intro silence / logos
+
         if win_start < 10:
             continue
 
+        # Prefer starting at the beginning of a thought/sentence
+        start_bonus = 1.15 if is_clean_start(utterances, i) else 0.85
+
+        char_count = len(start_utt["text"])
+
         for j in range(i + 1, len(utterances)):
+            char_count += len(utterances[j]["text"])
             win_end = utterances[j]["end"]
             length = win_end - win_start
 
             if length < 15:
                 continue
-            if length > 180:  # Hard cap at 3 minutes max
+            if length > 178:  # Leave 2s buffer so adding end padding never exceeds 180s
                 break
 
-            window_utterances = [u for u in utterances if u["start"] >= win_start and u["end"] <= win_end]
-            score = sum(len(u["text"]) for u in window_utterances)
+            # Only allow ending on a completed sentence or natural pause
+            if not is_clean_ending(utterances, j):
+                continue
+
+            # Score by speech density (chars/sec) so shorter high-energy moments beat bloated 3m clips
+            density = char_count / length
+            score = density * start_bonus
 
             if score > highest_score:
                 highest_score = score
                 best_start = win_start
                 best_end = win_end
 
-    start_time = max(0, int(best_start))
-    duration = int(min(180, max(15, best_end - best_start)))
+    # Fallback if auto-captions lacked punctuation/pauses: snap cleanly inside 15s-178s
+    if best_start is None or best_end is None:
+        best_start = next((u["start"] for u in utterances if u["start"] >= 10), utterances[0]["start"])
+        valid_ends = [u["end"] for u in utterances if 15 <= (u["end"] - best_start) <= 178]
+        best_end = valid_ends[len(valid_ends) // 2] if valid_ends else best_start + 30
 
-    # 3. Download exact analyzed window via yt-dlp
+    # Add a tiny 0.4s trailing breath buffer so the final word isn't clipped by FFmpeg keyframes
+    start_time = max(0.0, round(best_start - 0.2, 2))
+    end_time = round(min(best_start + 180.0, best_end + 0.4), 2)
+    duration = round(max(15.0, end_time - start_time), 2)
+
+    # 3. Download exact dynamically sized window via yt-dlp
     yt_dlp_cmd = [
         "yt-dlp",
         "--format", "best[ext=mp4]/best",
@@ -126,7 +166,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if os.path.exists("cookies.txt"):
         yt_dlp_cmd.extend(["--cookies", "cookies.txt"])
 
-    section_range = f"*{start_time}-{start_time + duration}"
+    section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd.extend(["--download-sections", section_range, request.url])
 
     try:
@@ -137,7 +177,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
 
-    # 4. Render vertical clip via FFmpeg: Solid black letterboxing (keeps landscape 100% intact, no blur/crop)
+    # 4. Render vertical clip via FFmpeg: Solid black letterboxing
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-i", raw_video_path,
