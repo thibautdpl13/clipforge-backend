@@ -53,11 +53,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract subtitles: Manual human-written first, fallback to auto-subs
+    # 1. Extract subtitles with mweb, android, web player client extractor args
     sub_cmd_manual = [
         "yt-dlp",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=android,web",
+        "--extractor-args", "youtube:player_client=mweb,android,web",
         "--write-subs",
         "--sub-format", "json3",
         "--skip-download",
@@ -67,7 +67,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     sub_cmd_auto = [
         "yt-dlp",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=android,web",
+        "--extractor-args", "youtube:player_client=mweb,android,web",
         "--write-auto-subs",
         "--sub-format", "json3",
         "--skip-download",
@@ -88,7 +88,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     sub_files = glob.glob("/tmp/sub.*.json3")
     if not sub_files:
         try:
-            res = subprocess.run(sub_cmd_auto, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(sub_cmd_auto, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as e:
             auto_err = e.stderr.decode('utf-8', errors='ignore')
             raise HTTPException(
@@ -184,7 +184,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 4. Precision Character-Based Chunking
+    # 4. Precision Character-Based Chunking with Strict Contiguous Handover (Zero Overlap, Zero Gaps)
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -243,12 +243,12 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 5. Download exact window via yt-dlp
+    # 5. Download exact window via yt-dlp with player client extractor args
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=android,web",
+        "--extractor-args", "youtube:player_client=mweb,android,web",
         "--format", "best[ext=mp4]/best",
         "--download-sections", section_range,
         "--output", raw_video_path,
@@ -288,36 +288,11 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_filter = ",".join(vf_filters)
 
-    ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-i", raw_video_path,
-        "-vf", video_filter,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "28",
-        "-threads", "1",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        output_path
-    ]
+---
 
-    try:
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        ff_err = e.stderr.decode('utf-8', errors='ignore')
-        raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[:300]}")
+### Terminal Commands to Push
 
-    if not os.path.exists(output_path):
-        raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
-
-    def cleanup():
-        for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path, srt_path]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
-
-    background_tasks.add_task(cleanup)
-
-    return FileResponse(output_path, media_type="video/mp4", filename="clip.mp4")
+```bash
+git add main.py
+git commit -m "Add mweb,android,web extractor args to yt-dlp to bypass empty subtitle stream responses"
+git push origin main
