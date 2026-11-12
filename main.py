@@ -113,7 +113,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
-        'remote_components': {'ejs': 'github'},
+        'remote_components': {'ejs': ['github']},
         'extractor_args': {'youtube': {'player_client': ['mweb', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
@@ -235,13 +235,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video with remote components challenge solver and format fallback
+    # 4. Download source video with corrected remote components list format and fallback
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'remote_components': {'ejs': 'github'},
+        'remote_components': {'ejs': ['github']},
         'extractor_args': {'youtube': {'player_client': ['mweb', 'web']}},
     }
     if os.path.exists(COOKIES_PATH):
