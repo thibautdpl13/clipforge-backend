@@ -102,7 +102,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Native Python yt-dlp extraction for subtitles to bypass rate limits
+    # 1. Native Python yt-dlp extraction for subtitles
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -123,7 +123,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     sub_files = glob.glob("/tmp/sub.*.vtt")
     word_timed_list = parse_vtt_file(sub_files[0]) if sub_files else []
 
-    # Fallback timing & caption simulation if rate-limited or missing
     if not word_timed_list:
         word_timed_list = [
             {"start": float(i * 3), "end": float((i + 1) * 3), "text": f"CLIPFORGE AI SEGMENT {i+1}"}
@@ -231,13 +230,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download exact window via native yt-dlp Python API with authenticated cookies
-    section_range = f"*{start_time}-{end_time}"
+    # 4. Download exact window via native yt-dlp Python API with robust format fallback
     ydl_opts_video = {
-        'format': 'best[ext=mp4]/best',
+        'format': 'b/bv+ba/b',
         'download_ranges': yt_dlp.utils.download_range_func(None, [(start_time, end_time)]),
         'outtmpl': raw_video_path,
         'quiet': True,
+        'merge_output_format': 'mp4'
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
@@ -249,7 +248,12 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail=f"YouTube download failed: {str(e)}")
 
     if not os.path.exists(raw_video_path):
-        raise HTTPException(status_code=500, detail="Failed to download video source.")
+        # Check if output was saved with mkv/webm extension from merging
+        possible_files = glob.glob("/tmp/raw_download.*")
+        if possible_files:
+            raw_video_path = possible_files[0]
+        else:
+            raise HTTPException(status_code=500, detail="Failed to download video source.")
 
     # 5. Render vertical clip (1080x1920) + Asap Extra Bold font (size 55, y=1180, shadowx=1:shadowy=1)
     vf_filters = [
@@ -291,7 +295,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[-300:]}")
 
     def cleanup():
-        for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path]:
+        for f in glob.glob("/tmp/sub.*") + glob.glob("/tmp/raw_download.*") + [output_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
