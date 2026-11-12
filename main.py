@@ -1,7 +1,6 @@
 import os
 import re
 import glob
-import json
 import subprocess
 from urllib.parse import urlparse, parse_qs
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -40,26 +39,72 @@ def health_check():
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
+def parse_vtt_file(vtt_path):
+    """Parses standard VTT subtitle files into word-timed list."""
+    word_timed_list = []
+    with open(vtt_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    def time_to_seconds(time_str):
+        parts = time_str.strip().split(':')
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s.replace(',', '.'))
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s.replace(',', '.'))
+        return 0.0
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "-->" in line:
+            parts = line.split("-->")
+            start_t = time_to_seconds(parts[0])
+            end_t = time_to_seconds(parts.split()[2])
+            
+            # Gather subtitle text lines until empty line
+            i += 1
+            text_lines = []
+            while i < len(lines) and lines[i].strip():
+                clean_line = re.sub(r'<[^>]*>', '', lines[i]).strip() # remove HTML tags if any
+                if clean_line:
+                    text_lines.append(clean_line)
+                i += 1
+            
+            full_text = " ".join(text_lines).replace("-", "").strip()
+            if full_text:
+                words = full_text.split()
+                duration = max(0.3, end_t - start_t)
+                time_per_word = duration / max(1, len(words))
+                for w_idx, word in enumerate(words):
+                    w_start = start_t + (w_idx * time_per_word)
+                    w_end = w_start + time_per_word
+                    word_timed_list.append({"start": w_start, "end": w_end, "text": word})
+        else:
+            i += 1
+            
+    return word_timed_list
+
 @app.post("/generate-auto-clip")
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
-    srt_path = "/tmp/clip_subs.srt"
 
-    for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path, srt_path]:
+    for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path]:
         if os.path.exists(f):
             try:
                 os.remove(f)
             except Exception:
                 pass
 
-    # 1. Extract subtitles with mweb, android, web player client extractor args
+    # 1. Extract subtitles using standard VTT format
     sub_cmd_manual = [
         "yt-dlp",
         "--remote-components", "ejs:github",
         "--extractor-args", "youtube:player_client=mweb,android,web",
         "--write-subs",
-        "--sub-format", "json3",
+        "--sub-format", "vtt",
         "--skip-download",
         "--output", "/tmp/sub",
         request.url
@@ -69,7 +114,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         "--remote-components", "ejs:github",
         "--extractor-args", "youtube:player_client=mweb,android,web",
         "--write-auto-subs",
-        "--sub-format", "json3",
+        "--sub-format", "vtt",
         "--skip-download",
         "--output", "/tmp/sub",
         request.url
@@ -79,69 +124,32 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         sub_cmd_manual.extend(["--cookies", COOKIES_PATH])
         sub_cmd_auto.extend(["--cookies", COOKIES_PATH])
 
-    manual_err = ""
-    try:
-        subprocess.run(sub_cmd_manual, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        manual_err = e.stderr.decode('utf-8', errors='ignore')
+    # Run manual subs
+    res_manual = subprocess.run(sub_cmd_manual, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    manual_output = res_manual.stderr.decode('utf-8', errors='ignore')
 
-    sub_files = glob.glob("/tmp/sub.*.json3")
+    sub_files = glob.glob("/tmp/sub.*.vtt")
     if not sub_files:
-        try:
-            subprocess.run(sub_cmd_auto, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except subprocess.CalledProcessError as e:
-            auto_err = e.stderr.decode('utf-8', errors='ignore')
+        # Run auto subs
+        res_auto = subprocess.run(sub_cmd_auto, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        auto_output = res_auto.stderr.decode('utf-8', errors='ignore')
+        sub_files = glob.glob("/tmp/sub.*.vtt")
+
+        if not sub_files:
             raise HTTPException(
                 status_code=400, 
-                detail=f"YT-DLP Subtitle Extraction Failed. Manual Err: {manual_err[:300]} | Auto Err: {auto_err[:300]}"
+                detail=f"Subtitle extraction failed. Manual Output: {manual_output[-300:]} | Auto Output: {auto_output[-300:]}"
             )
-        sub_files = glob.glob("/tmp/sub.*.json3")
-
-    if not sub_files:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Metadata analysis failed: No subtitle files generated. Manual Err: {manual_err[:300]}"
-        )
 
     try:
-        with open(sub_files[0], "r", encoding="utf-8") as f:
-            sub_data = json.load(f)
+        word_timed_list = parse_vtt_file(sub_files[0])
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse transcript: {str(e)}")
-
-    events = sub_data.get("events", [])
-    
-    # 2. Extract precise word-level timestamps directly from subtitle segments (segs)
-    word_timed_list = []
-    for ev in events:
-        start_ms = ev.get("tStartMs")
-        duration_ms = ev.get("dDurationMs", 3000)
-        segs = ev.get("segs", [])
-        
-        if start_ms is None:
-            continue
-            
-        base_start = start_ms / 1000.0
-        total_event_duration = duration_ms / 1000.0
-        
-        if segs:
-            seg_count = len(segs)
-            time_per_seg = total_event_duration / max(1, seg_count)
-            for idx, seg in enumerate(segs):
-                w_text = seg.get("utf8", "").replace("-", "").strip()
-                if w_text and w_text != "\n":
-                    w_start = base_start + (idx * time_per_seg)
-                    w_end = w_start + time_per_seg
-                    word_timed_list.append({"start": w_start, "end": w_end, "text": w_text})
-        else:
-            ev_text = "".join(seg.get("utf8", "") for seg in segs).replace("-", "").strip()
-            if ev_text and ev_text != "\n":
-                word_timed_list.append({"start": base_start, "end": base_start + total_event_duration, "text": ev_text})
+        raise HTTPException(status_code=500, detail=f"Failed to parse subtitle file: {str(e)}")
 
     if not word_timed_list:
-        raise HTTPException(status_code=400, detail="Transcript analysis failed: Subtitles are empty.")
+        raise HTTPException(status_code=400, detail="Transcript analysis failed: Parsed subtitles are empty.")
 
-    # 3. Viral Hook & Continuous Window Scoring Engine
+    # 2. Viral Hook & Continuous Window Scoring Engine
     best_start = None
     best_end = None
     highest_score = -1.0
@@ -184,7 +192,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 4. Precision Character-Based Chunking with Strict Contiguous Handover (Zero Overlap, Zero Gaps)
+    # 3. Precision Character-Based Chunking with Strict Contiguous Handover (Zero Overlap, Zero Gaps)
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -230,7 +238,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             "text": chunk_text
         })
 
-    # Strict contiguous handover: Each chunk ends exactly when the next one starts (Zero overlap, zero gaps)
     chunked_subtitles = []
     for i, rc in enumerate(raw_chunks):
         start_t = rc["start"]
@@ -243,7 +250,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 5. Download exact window via yt-dlp with player client extractor args
+    # 4. Download exact window via yt-dlp
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
@@ -258,16 +265,12 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     if os.path.exists(COOKIES_PATH):
         yt_dlp_cmd.extend(["--cookies", COOKIES_PATH])
 
-    try:
-        subprocess.run(yt_dlp_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        dl_err = e.stderr.decode('utf-8', errors='ignore')
-        raise HTTPException(status_code=400, detail=f"YouTube download failed: {dl_err[:300]}")
+    dl_res = subprocess.run(yt_dlp_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if dl_res.returncode != 0 or not os.path.exists(raw_video_path):
+        dl_err = dl_res.stderr.decode('utf-8', errors='ignore')
+        raise HTTPException(status_code=400, detail=f"YouTube download failed: {dl_err[-300:]}")
 
-    if not os.path.exists(raw_video_path):
-        raise HTTPException(status_code=500, detail="Failed to download video source.")
-
-    # 6. Render vertical clip + Asap Extra Bold font, smaller shadow, and zero-overlap continuous display
+    # 5. Render vertical clip + Asap Extra Bold font, smaller shadow, and zero-overlap continuous display
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -301,17 +304,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         output_path
     ]
 
-    try:
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError as e:
-        ff_err = e.stderr.decode('utf-8', errors='ignore')
-        raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[:300]}")
-
-    if not os.path.exists(output_path):
-        raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
+    ff_res = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if ff_res.returncode != 0 or not os.path.exists(output_path):
+        ff_err = ff_res.stderr.decode('utf-8', errors='ignore')
+        raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[-300:]}")
 
     def cleanup():
-        for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path, srt_path]:
+        for f in glob.glob("/tmp/sub.*") + [raw_video_path, output_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
