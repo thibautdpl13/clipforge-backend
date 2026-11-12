@@ -38,28 +38,6 @@ class ClipRequest(BaseModel):
 def health_check():
     return {"status": "running", "service": "ClipForge AI Backend"}
 
-def is_clean_ending(utterances, idx):
-    text = utterances[idx]["text"].strip()
-    ends_with_punct = text.endswith((".", "!", "?"))
-    
-    has_pause = False
-    if idx + 1 < len(utterances):
-        gap = utterances[idx + 1]["start"] - utterances[idx]["end"]
-        if gap >= 0.5:
-            has_pause = True
-    else:
-        has_pause = True
-
-    return ends_with_punct or has_pause
-
-def is_clean_start(utterances, idx):
-    if idx == 0:
-        return True
-    prev_text = utterances[idx - 1]["text"].strip()
-    prev_ended = prev_text.endswith((".", "!", "?"))
-    gap = utterances[idx]["start"] - utterances[idx - 1]["end"]
-    return prev_ended or gap >= 0.5
-
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
 @app.post("/generate-auto-clip")
@@ -75,7 +53,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Extract subtitles: Manual human-written first, fallback to auto-subs with player client extractor args
+    # 1. Extract subtitles: Manual human-written first, fallback to auto-subs
     sub_cmd_manual = [
         "yt-dlp",
         "--remote-components", "ejs:github",
@@ -101,21 +79,29 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         sub_cmd_manual.extend(["--cookies", COOKIES_PATH])
         sub_cmd_auto.extend(["--cookies", COOKIES_PATH])
 
+    manual_err = ""
     try:
         subprocess.run(sub_cmd_manual, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError:
-        pass
+    except subprocess.CalledProcessError as e:
+        manual_err = e.stderr.decode('utf-8', errors='ignore')
 
     sub_files = glob.glob("/tmp/sub.*.json3")
     if not sub_files:
         try:
-            subprocess.run(sub_cmd_auto, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            res = subprocess.run(sub_cmd_auto, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=400, detail=f"Transcript extraction failed: {e.stderr.decode('utf-8', errors='ignore')}")
+            auto_err = e.stderr.decode('utf-8', errors='ignore')
+            raise HTTPException(
+                status_code=400, 
+                detail=f"YT-DLP Subtitle Extraction Failed. Manual Err: {manual_err[:300]} | Auto Err: {auto_err[:300]}"
+            )
         sub_files = glob.glob("/tmp/sub.*.json3")
 
     if not sub_files:
-        raise HTTPException(status_code=400, detail="Metadata analysis failed: No captions available for this video.")
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Metadata analysis failed: No subtitle files generated. Manual Err: {manual_err[:300]}"
+        )
 
     try:
         with open(sub_files[0], "r", encoding="utf-8") as f:
@@ -198,7 +184,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 4. Precision Character-Based Chunking with Strict Contiguous Handover (Zero Overlap, Zero Gaps)
+    # 4. Precision Character-Based Chunking
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -251,13 +237,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         end_t = rc["end"]
         if i + 1 < len(raw_chunks):
             next_start = raw_chunks[i + 1]["start"]
-            end_t = next_start  # Hand over control instantly at next word start
+            end_t = next_start
         else:
-            end_t = rc["end"] + 1.0  # Linger final chunk slightly
+            end_t = rc["end"] + 1.0
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 5. Download exact window via yt-dlp with player client extractor args
+    # 5. Download exact window via yt-dlp
     section_range = f"*{start_time}-{end_time}"
     yt_dlp_cmd = [
         "yt-dlp",
@@ -275,7 +261,8 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     try:
         subprocess.run(yt_dlp_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=400, detail=f"YouTube download failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        dl_err = e.stderr.decode('utf-8', errors='ignore')
+        raise HTTPException(status_code=400, detail=f"YouTube download failed: {dl_err[:300]}")
 
     if not os.path.exists(raw_video_path):
         raise HTTPException(status_code=500, detail="Failed to download video source.")
@@ -317,7 +304,8 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     try:
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        ff_err = e.stderr.decode('utf-8', errors='ignore')
+        raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[:300]}")
 
     if not os.path.exists(output_path):
         raise HTTPException(status_code=500, detail="Clip rendering completed but output file is missing.")
