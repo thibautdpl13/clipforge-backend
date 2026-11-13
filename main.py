@@ -23,11 +23,18 @@ COOKIES_PATH = "/tmp/cookies.txt"
 
 @app.on_event("startup")
 def startup_event():
+    # 1. Fix Debian/Ubuntu nodejs vs node binary name mismatch for yt-dlp EJS challenge solver
+    try:
+        if not os.path.exists("/usr/bin/node") and os.path.exists("/usr/bin/nodejs"):
+            os.symlink("/usr/bin/nodejs", "/usr/bin/node")
+            print("SUCCESS: Created symlink /usr/bin/node -> /usr/bin/nodejs")
+    except Exception as e:
+        print(f"Node symlink notice: {e}")
+
     try:
         subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api"], check=True)
-        print("SUCCESS: Upgraded packages on startup.")
-    except Exception as e:
-        print(f"WARNING: Package upgrade notice: {e}")
+    except Exception:
+        pass
 
     cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookie_content:
@@ -46,7 +53,7 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Authenticated Mode)"}
+    return {"status": "running", "service": "ClipForge AI Backend (EJS Symlinked Mode)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -77,20 +84,23 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_id = extract_video_id(request.url)
 
-    # 1. Fetch timed transcripts with robust fallback handling
+    # 1. Fetch timed transcripts with comprehensive version fallbacks
     word_timed_list = []
+    fetched_entries = None
     try:
-        fetched_entries = None
         try:
             fetched_entries = YouTubeTranscriptApi.get_transcript(video_id)
         except Exception:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            for t in transcript_list:
-                try:
-                    fetched_entries = t.fetch()
-                    break
-                except Exception:
-                    continue
+            try:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                for t in transcript_list:
+                    try:
+                        fetched_entries = t.fetch()
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
         if fetched_entries:
             for entry in fetched_entries:
@@ -217,7 +227,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using authenticated cookies
+    # 4. Download source video with cookies and JavaScript challenge execution enabled
     ydl_opts_video = {
         'format': 'best[ext=mp4]/best',
         'outtmpl': raw_video_path,
