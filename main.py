@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Elite Engine", version="10.0.0")
+app = FastAPI(title="ClipForge AI Elite Engine", version="10.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,7 +26,6 @@ def get_whisper_model():
     global whisper_model
     if whisper_model is None:
         try:
-            # Initialize faster-whisper CPU model optimized for low RAM footprint (<300MB RAM)
             whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
         except Exception as e:
             print(f"Failed to load Whisper model: {e}")
@@ -61,6 +60,14 @@ def health_check() -> Dict[str, Any]:
         "font": ensure_heavy_font()
     }
 
+def clean_and_format_text(text: str) -> str:
+    """Fixes number comma spacing and preserves apostrophes."""
+    # Fix comma spacing in numbers e.g. "100 , 000" -> "100,000"
+    formatted = re.sub(r'(\d)\s*,\s*(\d)', r'\1,\2', text)
+    # Convert to uppercase for creator style
+    formatted = formatted.upper()
+    return formatted
+
 @app.post("/upload-and-clip")
 async def upload_and_clip(
     file: UploadFile = File(...), 
@@ -87,7 +94,6 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    # Get exact video duration via ffprobe
     duration = 35.0
     try:
         probe_cmd = [
@@ -103,7 +109,6 @@ async def upload_and_clip(
 
     clip_duration = min(duration, 45.0)
 
-    # Extract clean 16kHz mono audio WAV for Whisper
     try:
         extract_cmd = [
             "ffmpeg", "-y", "-i", input_video_path,
@@ -114,7 +119,6 @@ async def upload_and_clip(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
-    # Run faster-whisper transcription with precise word-level timestamps
     word_timed_list = []
     model = get_whisper_model()
     if model and os.path.exists(audio_wav_path):
@@ -123,24 +127,27 @@ async def upload_and_clip(
             for segment in segments:
                 if hasattr(segment, "words") and segment.words:
                     for w in segment.words:
-                        clean_word = re.sub(r'[^a-zA-Z0-9\$\s\?\!\,]', '', w.word).strip().upper()
+                        # Allow letters, numbers, apostrophes, and commas
+                        raw_w = w.word.strip()
+                        clean_word = re.sub(r'[^a-zA-Z0-9\$\'\,\s\?\!]', '', raw_w).strip()
                         if clean_word:
+                            formatted_word = clean_and_format_text(clean_word)
                             word_timed_list.append({
                                 "start": float(w.start),
                                 "end": float(w.end),
-                                "text": clean_word
+                                "text": formatted_word
                             })
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
     if not word_timed_list:
         word_timed_list = [
-            {"start": 0.0, "end": clip_duration, "text": "CLIPFORGE ELITE AI ENGINE"}
+            {"start": 0.0, "end": clip_duration, "text": "CLIPFORGE AI"}
         ]
 
     font_file = ensure_heavy_font()
 
-    # Intelligent Word Grouping into Reader-Friendly Chunks (Max 3-4 words per screen flash)
+    # Intelligent Word Grouping into Reader-Friendly Chunks (Max 3-4 words)
     chunked_subtitles = []
     current_chunk = []
     chunk_start = None
@@ -165,7 +172,6 @@ async def upload_and_clip(
             "text": " ".join(current_chunk)
         })
 
-    # Render vertical video (1080x1920) with Montserrat-Black font at size 52, y=1160
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
