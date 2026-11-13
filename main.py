@@ -23,6 +23,13 @@ COOKIES_PATH = "/tmp/cookies.txt"
 
 @app.on_event("startup")
 def startup_event():
+    # Automatically update yt-dlp to latest version on every deploy/restart to beat YouTube patches
+    try:
+        subprocess.run(["pip", "install", "--upgrade", "yt-dlp"], check=True)
+        print("SUCCESS: Upgraded yt-dlp to latest version on startup.")
+    except Exception as e:
+        print(f"WARNING: Failed to auto-upgrade yt-dlp: {e}")
+
     cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookie_content:
         cookie_content = cookie_content.replace("\r\n", "\n")
@@ -40,7 +47,7 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Robust Mode)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Auto-Update Engine)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -74,32 +81,21 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     # 1. Fetch timed transcripts safely
     word_timed_list = []
     try:
-        # Instantiate or fetch using list/get safely across versions
-        transcript_list = None
-        try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt'])
-        except Exception:
-            # Fallback to listing available transcripts if specific languages fail
-            tx_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            for t in tx_list:
-                transcript_list = t.fetch()
-                break
-
-        if transcript_list:
-            for entry in transcript_list:
-                start = entry.get('start', 0.0)
-                dur = entry.get('duration', 2.0)
-                text = entry.get('text', '').replace('\n', ' ')
-                words = text.split()
-                if not words:
-                    continue
-                per_word = dur / len(words)
-                for idx, w in enumerate(words):
-                    clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
-                    if clean_w:
-                        w_start = start + (idx * per_word)
-                        w_end = w_start + per_word
-                        word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt'])
+        for entry in transcript_list:
+            start = entry.get('start', 0.0)
+            dur = entry.get('duration', 2.0)
+            text = entry.get('text', '').replace('\n', ' ')
+            words = text.split()
+            if not words:
+                continue
+            per_word = dur / len(words)
+            for idx, w in enumerate(words):
+                clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
+                if clean_w:
+                    w_start = start + (idx * per_word)
+                    w_end = w_start + per_word
+                    word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
     except Exception as e:
         print(f"Transcript fetch notice: {str(e)}")
 
@@ -210,14 +206,16 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using yt-dlp Android client without conflicting cookies
+    # 4. Download source video using latest yt-dlp with iOS/Web client rotation and cookie support
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'extractor_args': {'youtube': {'player_client': ['android']}},
+        'extractor_args': {'youtube': {'player_client': ['ios', 'mweb', 'web']}},
     }
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts_video['cookiefile'] = COOKIES_PATH
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
