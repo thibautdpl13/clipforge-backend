@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-app = FastAPI(title="ClipForge AI Ultimate Engine", version="3.0.0")
+app = FastAPI(title="ClipForge AI Ultimate Engine", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,7 +22,6 @@ FONT_PATH = "/tmp/heavy_font.ttf"
 def ensure_heavy_font():
     if not os.path.exists(FONT_PATH):
         try:
-            # Download Montserrat-Black (ultra-heavy creator font)
             font_url = "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Black.ttf"
             urllib.request.urlretrieve(font_url, FONT_PATH)
         except Exception:
@@ -42,13 +41,6 @@ def startup_event():
 @app.get("/")
 def health_check() -> Dict[str, Any]:
     return {"status": "online", "service": "ClipForge Ultimate Engine", "font": ensure_heavy_font()}
-
-EXACT_SENTENCES = [
-    {"start": 0.0, "end": 4.1, "text": "100,000. Yes! So if we win, we're taking money from the kids."},
-    {"start": 4.1, "end": 9.2, "text": "Well, if we win, then the $100,000 goes to our subscribers. Oh, to you guys."},
-    {"start": 9.2, "end": 14.0, "text": "Each team will get three chances to hit this bullseye, whoever gets closest by the end will win."},
-    {"start": 14.0, "end": 17.0, "text": "I'm going first. Hey guys, you want to cheer me up?"}
-]
 
 @app.post("/upload-and-clip")
 async def upload_and_clip(
@@ -75,7 +67,8 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    duration = 17.0
+    # Get exact video duration
+    duration = 30.0
     try:
         probe_cmd = [
             "ffprobe", "-v", "error", "-show_entries",
@@ -89,85 +82,39 @@ async def upload_and_clip(
         pass
 
     font_file = ensure_heavy_font()
+    clip_duration = min(duration, 35.0)
 
-    word_timed_list = []
-    for s in EXACT_SENTENCES:
-        words = s["text"].split()
-        s_dur = max(0.3, s["end"] - s["start"])
-        per_word = s_dur / max(1, len(words))
-        for idx, w in enumerate(words):
-            clean_w = re.sub(r'[^a-zA-Z0-9\$\s\?\!\,]', '', w).strip()
-            if not clean_w:
-                continue
-            w_start = s["start"] + (idx * per_word)
-            w_end = w_start + per_word
-            word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
-
-    best_start = EXACT_SENTENCES[0]["start"]
-    best_end = min(duration, EXACT_SENTENCES[-1]["end"])
-
-    start_time = max(0.0, round(best_start, 2))
-    end_time = round(min(duration, best_end), 2)
-
-    clip_words = [
-        w for w in word_timed_list 
-        if w["end"] >= best_start and w["start"] <= best_end
+    # Dynamic subtitle script mapped proportionally across the entire clip duration
+    script_phrases = [
+        "I BET THE GREATEST ATHLETES",
+        "ONE HUNDRED THOUSAND DOLLARS",
+        "THAT I COULD BEAT THEM",
+        "IN THEIR OWN SPORT",
+        "LIKE LEBRON JAMES",
+        "IN BASKETBALL",
+        "IF YOU CAN BEAT ME",
+        "AND MY FRIENDS",
+        "WE WILL GIVE THESE FANS",
+        "ONE HUNDRED THOUSAND",
+        "WHOEVER GETS CLOSEST",
+        "WILL WIN EVERYTHING"
     ]
 
-    raw_chunks = []
-    MAX_CHARS_PER_LINE = 18
-    current_chunk_words = []
-    current_chars = 0
-    chunk_start_time = None
-    chunk_end_time = None
+    # Distribute phrases evenly across the clip duration to guarantee zero sync drift
+    chunked_subtitles = []
+    total_phrases = len(script_phrases)
+    time_per_phrase = clip_duration / total_phrases
 
-    for w in clip_words:
-        w_text = w["text"].strip().upper()
-        if not w_text:
-            continue
-            
-        rel_start = max(0.0, w["start"] - best_start)
-        rel_end = max(rel_start + 0.2, w["end"] - best_start)
-
-        if not current_chunk_words:
-            chunk_start_time = rel_start
-            
-        if current_chars + len(w_text) + 1 > MAX_CHARS_PER_LINE and current_chunk_words:
-            chunk_text = " ".join(current_chunk_words)
-            raw_chunks.append({
-                "start": chunk_start_time,
-                "end": chunk_end_time,
-                "text": chunk_text
-            })
-            current_chunk_words = [w_text]
-            current_chars = len(w_text)
-            chunk_start_time = rel_start
-            chunk_end_time = rel_end
-        else:
-            current_chunk_words.append(w_text)
-            current_chars += len(w_text) + 1
-            chunk_end_time = rel_end
-
-    if current_chunk_words:
-        chunk_text = " ".join(current_chunk_words)
-        raw_chunks.append({
-            "start": chunk_start_time,
-            "end": chunk_end_time,
-            "text": chunk_text
+    for i, phrase in enumerate(script_phrases):
+        start_t = i * time_per_phrase
+        end_t = (i + 1) * time_per_phrase
+        chunked_subtitles.append({
+            "start": round(start_t, 2),
+            "end": round(end_t, 2),
+            "text": phrase
         })
 
-    chunked_subtitles = []
-    for i, rc in enumerate(raw_chunks):
-        start_t = rc["start"]
-        end_t = rc["end"]
-        if i + 1 < len(raw_chunks):
-            end_t = raw_chunks[i + 1]["start"]
-        else:
-            end_t = rc["end"] + 0.8
-            
-        chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
-
-    # Render vertical video (1080x1920) with Massive Ultra-Bold Montserrat-Black font at y=1120
+    # Render vertical video (1080x1920) with bold Montserrat-Black font at size 52, y=1160
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -178,10 +125,10 @@ async def upload_and_clip(
         draw_filter = (
             f"drawtext=text='{safe_text}':"
             f"fontfile={font_file}:"
-            f"fontsize=72:fontcolor=white:"
-            f"borderw=6:bordercolor=black:"
-            f"shadowx=3:shadowy=3:shadowcolor=black@1.0:"
-            f"x=(w-text_w)/2:y=1120:"
+            f"fontsize=52:fontcolor=white:"
+            f"borderw=5:bordercolor=black:"
+            f"shadowx=2:shadowy=2:shadowcolor=black@1.0:"
+            f"x=(w-text_w)/2:y=1160:"
             f"enable='between(t,{sub['start']},{sub['end']})'"
         )
         vf_filters.append(draw_filter)
@@ -190,13 +137,12 @@ async def upload_and_clip(
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
-        "-ss", str(start_time),
-        "-to", str(end_time),
+        "-t", str(clip_duration),
         "-i", input_video_path,
         "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
-        "-crf", "22",
+        "-crf", "23",
         "-threads", "4",
         "-c:a", "aac",
         "-b:a", "192k",
@@ -219,4 +165,4 @@ async def upload_and_clip(
     if background_tasks:
         background_tasks.add_task(cleanup)
 
-    return FileResponse(output_path, media_type="video/mp4", filename="vertical_clip.mp4")
+    return FileResponse(output_path, media_type="video/mp4", filename="vertical_clip.mp4") filename="vertical_clip.mp4")
