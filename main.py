@@ -21,9 +21,16 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_event():
+    # Ensure node symlink exists for yt-dlp EJS challenge solver
+    try:
+        if not os.path.exists("/usr/bin/node") and os.path.exists("/usr/bin/nodejs"):
+            os.symlink("/usr/bin/nodejs", "/usr/bin/node")
+    except Exception:
+        pass
+
     try:
         subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api", "requests"], check=True)
-        print("SUCCESS: Dependencies verified.")
+        print("SUCCESS: Dependencies verified and upgraded.")
     except Exception as e:
         print(f"Startup notice: {e}")
 
@@ -32,7 +39,7 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Active Bridge Mode)"}
+    return {"status": "running", "service": "ClipForge AI Backend (EJS Hardened Mode)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -63,7 +70,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_id = extract_video_id(request.url)
 
-    # 1. Fetch timed transcripts with comprehensive fallback handling
+    # 1. Fetch timed transcripts with robust fallbacks
     word_timed_list = []
     fetched_entries = None
     try:
@@ -206,27 +213,37 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Resolve and stream raw video via media bridge API
+    # 4. Resolve video stream via Cobalt API with proper headers
     media_url = None
     try:
         api_payload = {'url': request.url, 'vCodec': 'h264', 'vQuality': '720'}
-        api_headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
-        r_api = requests.post('https://api.cobalt.tools/api/json', json=api_payload, headers=api_headers, timeout=10)
+        api_headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        r_api = requests.post('https://api.cobalt.tools/api/json', json=api_payload, headers=api_headers, timeout=12)
         if r_api.status_code == 200:
             data = r_api.json()
             media_url = data.get('url') or data.get('picker', [{}])[0].get('url')
     except Exception as e:
         print(f"Bridge resolver notice: {e}")
 
-    # Fallback to direct download attempt if bridge is busy
+    # Fallback to yt-dlp with explicit node js_runtimes configuration if bridge misses
     if not media_url:
         try:
             import yt_dlp
-            ydl_opts = {'format': 'best[ext=mp4]/best', 'outtmpl': raw_video_path, 'quiet': True}
+            ydl_opts = {
+                'format': 'best[ext=mp4]/best',
+                'outtmpl': raw_video_path,
+                'quiet': True,
+                'js_runtimes': {'node': '/usr/bin/node'},
+                'extractor_args': {'youtube': {'player_client': ['ios', 'android', 'web']}}
+            }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([request.url])
         except Exception as ex:
-            raise HTTPException(status_code=502, detail=f"All download routes blocked by YouTube datacenter restrictions: {str(ex)}")
+            raise HTTPException(status_code=502, detail=f"All download routes blocked: {str(ex)}")
 
     if media_url:
         try:
