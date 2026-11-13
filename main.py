@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import urllib.request
 import subprocess
 from typing import List, Dict, Any
@@ -8,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.7.0")
+app = FastAPI(title="ClipForge AI Demo Engine", version="10.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +56,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Stable Engine",
+        "service": "ClipForge Demo Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
@@ -86,7 +87,7 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    # 1. Get exact video duration
+    # 1. Get exact video duration via ffprobe
     duration = 45.0
     try:
         probe_cmd = [
@@ -100,18 +101,9 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    # Determine dynamic clip duration between 15s and 180s (3 minutes) based on video length
-    if duration <= 15.0:
-        clip_duration = duration
-        start_time = 0.0
-    else:
-        # Target a natural clip length up to 60s (or full duration if shorter than 3 mins), bounded between 15s and 180s
-        clip_duration = min(duration, max(15.0, min(60.0, duration)))
-
     try:
         extract_cmd = [
             "ffmpeg", "-y", "-i", input_video_path,
-            "-t", str(duration),
             "-ar", "16000", "-ac", "1", audio_wav_path
         ]
         subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -119,24 +111,22 @@ async def upload_and_clip(
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
     raw_word_list = []
-    first_speech_time = 0.0
+    sentence_starts = []
     model = get_whisper_model()
+    
     if model and os.path.exists(audio_wav_path):
         try:
             segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
             segments_list = list(segments)
             
-            # Find an intelligent start point if the video is long enough, avoiding dead air at 0.0
-            if segments_list and duration > 30.0:
-                # Look for the first major sentence or an engaging segment past the 2-second mark
-                for seg in segments_list:
-                    if seg.start > 2.0 and len(seg.text.strip().split()) > 4:
-                        first_speech_time = float(seg.start)
-                        break
+            for seg in segments_list:
+                seg_start = float(seg.start)
+                # Collect sentence/segment starting points that leave enough room for at least a 15s clip
+                if seg_start + 15.0 <= duration:
+                    sentence_starts.append(seg_start)
 
-            for segment in segments_list:
-                if hasattr(segment, "words") and segment.words:
-                    for w in segment.words:
+                if hasattr(seg, "words") and seg.words:
+                    for w in seg.words:
                         raw_w = w.word.strip()
                         clean_w = re.sub(r'[^a-zA-Z0-9\$\'\,\s\?\!]', '', raw_w).strip()
                         if clean_w:
@@ -148,13 +138,22 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
-    # Set smart start time ensuring we don't overflow the video length
+    # 2. Pick a random sentence start point (or fallback to 0.0 if video is too short)
     start_time = 0.0
-    if duration > clip_duration and first_speech_time > 0.0:
-        if first_speech_time + clip_duration <= duration:
-            start_time = first_speech_time
+    if sentence_starts:
+        start_time = random.choice(sentence_starts)
 
-    # Filter words to our chosen time window and normalize timestamps relative to clip start
+    # 3. Determine dynamic clip duration between 15s and 180s (3 mins) based on remaining video length
+    remaining_time = duration - start_time
+    if remaining_time <= 15.0:
+        start_time = 0.0
+        remaining_time = duration
+
+    # Aim for a natural clip length (e.g., between 30s and 60s, or up to 180s if available)
+    target_natural_len = random.uniform(30.0, min(90.0, remaining_time))
+    clip_duration = min(remaining_time, max(15.0, min(180.0, target_natural_len)))
+
+    # Filter words to the chosen random time window and normalize timestamps relative to clip start
     windowed_words = [w for w in raw_word_list if start_time <= w["start"] < (start_time + clip_duration)]
     for w in windowed_words:
         w["start"] = max(0.0, w["start"] - start_time)
