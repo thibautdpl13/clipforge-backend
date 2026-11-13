@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.6.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -86,6 +86,7 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
+    # 1. Get exact video duration
     duration = 45.0
     try:
         probe_cmd = [
@@ -99,9 +100,18 @@ async def upload_and_clip(
     except Exception:
         pass
 
+    # Determine dynamic clip duration between 15s and 180s (3 minutes) based on video length
+    if duration <= 15.0:
+        clip_duration = duration
+        start_time = 0.0
+    else:
+        # Target a natural clip length up to 60s (or full duration if shorter than 3 mins), bounded between 15s and 180s
+        clip_duration = min(duration, max(15.0, min(60.0, duration)))
+
     try:
         extract_cmd = [
             "ffmpeg", "-y", "-i", input_video_path,
+            "-t", str(duration),
             "-ar", "16000", "-ac", "1", audio_wav_path
         ]
         subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -109,20 +119,24 @@ async def upload_and_clip(
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
     raw_word_list = []
-    segment_data = []
+    first_speech_time = 0.0
     model = get_whisper_model()
     if model and os.path.exists(audio_wav_path):
         try:
             segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
             segments_list = list(segments)
-            for seg in segments_list:
-                segment_data.append({
-                    "start": float(seg.start),
-                    "end": float(seg.end),
-                    "text": seg.text
-                })
-                if hasattr(seg, "words") and seg.words:
-                    for w in seg.words:
+            
+            # Find an intelligent start point if the video is long enough, avoiding dead air at 0.0
+            if segments_list and duration > 30.0:
+                # Look for the first major sentence or an engaging segment past the 2-second mark
+                for seg in segments_list:
+                    if seg.start > 2.0 and len(seg.text.strip().split()) > 4:
+                        first_speech_time = float(seg.start)
+                        break
+
+            for segment in segments_list:
+                if hasattr(segment, "words") and segment.words:
+                    for w in segment.words:
                         raw_w = w.word.strip()
                         clean_w = re.sub(r'[^a-zA-Z0-9\$\'\,\s\?\!]', '', raw_w).strip()
                         if clean_w:
@@ -134,9 +148,21 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
+    # Set smart start time ensuring we don't overflow the video length
+    start_time = 0.0
+    if duration > clip_duration and first_speech_time > 0.0:
+        if first_speech_time + clip_duration <= duration:
+            start_time = first_speech_time
+
+    # Filter words to our chosen time window and normalize timestamps relative to clip start
+    windowed_words = [w for w in raw_word_list if start_time <= w["start"] < (start_time + clip_duration)]
+    for w in windowed_words:
+        w["start"] = max(0.0, w["start"] - start_time)
+        w["end"] = max(0.0, w["end"] - start_time)
+
     # 1. Merge split number/comma tokens (e.g. "100" and ",000" -> "100,000")
     merged_list = []
-    for w in raw_word_list:
+    for w in windowed_words:
         if merged_list and (w["text"].startswith(",") or w["text"] == ","):
             merged_list[-1]["text"] += w["text"]
             merged_list[-1]["end"] = w["end"]
@@ -144,58 +170,21 @@ async def upload_and_clip(
             merged_list.append(w)
 
     # 2. Strip useless "A " before dollar amounts (e.g., "A $250,000" -> "$250,000")
-    cleaned_word_list = []
+    word_timed_list = []
     i = 0
     while i < len(merged_list):
         curr = merged_list[i]
         if curr["text"] == "A" and i + 1 < len(merged_list) and merged_list[i + 1]["text"].startswith("$"):
             next_token = merged_list[i + 1]
             next_token["start"] = curr["start"]
-            cleaned_word_list.append(next_token)
+            word_timed_list.append(next_token)
             i += 2
         else:
-            cleaned_word_list.append(curr)
+            word_timed_list.append(curr)
             i += 1
 
-    if not cleaned_word_list:
-        cleaned_word_list = [
-            {"start": 0.0, "end": min(duration, 45.0), "text": "CLIPFORGE AI"}
-        ]
-
-    # 3. Lightweight Smart Hook & Duration Selector (15s to 180s)
-    # Avoids defaulting to 0.0 if there are later segments, and respects natural speech boundaries.
-    start_time = 0.0
-    clip_duration = min(duration, 45.0)
-
-    if duration > 15.0 and len(segment_data) > 1:
-        # Pick the segment with highest text density or exclamation/excitement after the first 3 seconds
-        best_seg_idx = 0
-        best_score = -1
-        for idx, seg in enumerate(segment_data):
-            score = len(seg["text"].split())
-            if "!" in seg["text"] or "?" in seg["text"] or "$" in seg["text"]:
-                score += 5
-            # Prefer moments a bit past the very beginning if available
-            if seg["start"] > 2.0 and score > best_score:
-                best_score = score
-                best_seg_idx = idx
-
-        start_time = max(0.0, segment_data[best_seg_idx]["start"])
-        # Calculate dynamic duration aiming for 30s-60s, bounded between 15s and 180s (3 minutes)
-        remaining_time = duration - start_time
-        desired_len = min(60.0, max(30.0, remaining_time))
-        clip_duration = min(remaining_time, max(15.0, desired_len))
-        if clip_duration > 180.0:
-            clip_duration = 180.0
-
-    # Filter words to the winning time window and normalize timestamps relative to clip start
-    windowed_words = [w for w in cleaned_word_list if start_time <= w["start"] < (start_time + clip_duration)]
-    for w in windowed_words:
-        w["start"] = max(0.0, w["start"] - start_time)
-        w["end"] = max(0.0, w["end"] - start_time)
-
-    if not windowed_words:
-        windowed_words = [
+    if not word_timed_list:
+        word_timed_list = [
             {"start": 0.0, "end": clip_duration, "text": "CLIPFORGE AI"}
         ]
 
@@ -206,7 +195,7 @@ async def upload_and_clip(
     current_chunk = []
     chunk_start = None
 
-    for w in windowed_words:
+    for w in word_timed_list:
         if not current_chunk:
             chunk_start = w["start"]
         current_chunk.append(w["text"])
@@ -222,7 +211,7 @@ async def upload_and_clip(
     if current_chunk:
         chunked_subtitles.append({
             "start": round(chunk_start, 2),
-            "end": round(windowed_words[-1]["end"], 2),
+            "end": round(word_timed_list[-1]["end"], 2),
             "text": " ".join(current_chunk)
         })
 
