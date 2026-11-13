@@ -2,10 +2,10 @@ import os
 import re
 import glob
 import subprocess
+import json
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from youtube_transcript_api import YouTubeTranscriptApi
 
 app = FastAPI()
 
@@ -19,7 +19,7 @@ app.add_middleware(
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Precise Cut & Sync Engine)"}
+    return {"status": "running", "service": "ClipForge AI Backend (yt-dlp Subtitle Engine)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this", "guess", "here"}
 
@@ -76,52 +76,53 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    # 2. Fetch real transcript from YouTube API
+    # 2. Extract transcript using yt-dlp subtitle dump (Bypasses download blocks completely)
     word_timed_list = []
-    fetched_entries = None
-    
     clean_url = url.strip()
+    
     if clean_url:
-        video_id = extract_video_id(clean_url)
         try:
-            try:
-                fetched_entries = YouTubeTranscriptApi.get_transcript(video_id)
-            except Exception:
-                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                for t in transcript_list:
-                    try:
-                        fetched_entries = t.fetch()
-                        break
-                    except Exception:
-                        continue
+            # Use yt-dlp to write subtitles to JSON without downloading media
+            sub_json_cmd = [
+                "yt-dlp", "--skip-download", "--write-auto-subs", "--write-subs",
+                "--sub-format", "json3", "-o", "/tmp/ytdlp_sub", clean_url
+            ]
+            subprocess.run(sub_json_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            
+            # Find generated json3 subtitle files in /tmp
+            sub_files = glob.glob("/tmp/ytdlp_sub*.json3")
+            if sub_files:
+                with open(sub_files[0], "r", encoding="utf-8") as sf:
+                    sub_data = json.load(sf)
+                    for event in sub_data.get("events", []):
+                        segs = event.get("segs", [])
+                        t_start = event.get("tStartMs", 0) / 1000.0
+                        d_dur = event.get("dDurationMs", 2000) / 1000.0
+                        
+                        full_text = "".join(s.get("utf8", "") for s in segs).replace("\n", " ").strip()
+                        if not full_text:
+                            continue
+                            
+                        words = full_text.split()
+                        per_word = (d_dur / max(1, len(words)))
+                        for idx, w in enumerate(words):
+                            clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
+                            if clean_w:
+                                w_start = t_start + (idx * per_word)
+                                w_end = w_start + per_word
+                                word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
         except Exception as e:
-            print(f"Transcript fetch error: {e}")
+            print(f"yt-dlp subtitle extraction error: {e}")
 
-    if fetched_entries:
-        for entry in fetched_entries:
-            start = entry.get('start', 0.0)
-            dur = entry.get('duration', 2.0)
-            text = entry.get('text', '').replace('\n', ' ')
-            words = text.split()
-            if not words:
-                continue
-            per_word = dur / len(words)
-            for idx, w in enumerate(words):
-                clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
-                if clean_w:
-                    w_start = start + (idx * per_word)
-                    w_end = w_start + per_word
-                    word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
-
+    # Fallback if yt-dlp subtitles couldn't be parsed
     if not word_timed_list:
-        raise HTTPException(status_code=400, detail="Could not fetch YouTube transcript. Please ensure the YouTube URL is provided and valid.")
+        raise HTTPException(status_code=400, detail="Could not extract subtitles. Please ensure a valid YouTube URL is provided.")
 
-    # 3. Intelligent Viral Hook Scoring Engine (Avoids starting at 0.0 unless it's the best hook)
+    # 3. Intelligent Viral Hook Scoring Engine
     best_start = word_timed_list[0]["start"]
     best_end = word_timed_list[-1]["end"]
     highest_score = -1.0
-
-    target_clip_length = min(35.0, duration) # aim for ~30-35s viral sweet spot
+    target_clip_length = min(35.0, duration)
 
     for i, w in enumerate(word_timed_list):
         win_start = w["start"]
@@ -148,7 +149,6 @@ async def upload_and_clip(
             has_hook = any(hw in wj["text"].lower() for hw in HOOK_WORDS) or "?" in full_window_text
             hook_bonus = 2.5 if has_hook else 1.0
             
-            # Prefer clips closest to target length
             length_penalty = abs(length - target_clip_length) * 0.02
             viral_score = (density * hook_bonus) - length_penalty
 
@@ -214,7 +214,7 @@ async def upload_and_clip(
         start_t = rc["start"]
         end_t = rc["end"]
         if i + 1 < len(raw_chunks):
-            end_t = raw_chunks[i + 1]["start"] # transition right when next chunk starts
+            end_t = raw_chunks[i + 1]["start"]
         else:
             end_t = rc["end"] + 0.8
             
@@ -262,7 +262,7 @@ async def upload_and_clip(
         raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[-300:]}")
 
     def cleanup():
-        for f in [input_video_path, output_path]:
+        for f in [input_video_path, output_path, *glob.glob("/tmp/ytdlp_sub*")]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
