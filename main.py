@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Demo Engine", version="10.8.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.5.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,7 +56,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Demo Engine",
+        "service": "ClipForge Stable Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
@@ -87,8 +87,7 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    # 1. Get exact video duration via ffprobe
-    duration = 45.0
+    duration = 35.0
     try:
         probe_cmd = [
             "ffprobe", "-v", "error", "-show_entries",
@@ -111,22 +110,19 @@ async def upload_and_clip(
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
     raw_word_list = []
-    sentence_starts = []
+    segment_starts = []
     model = get_whisper_model()
     
     if model and os.path.exists(audio_wav_path):
         try:
             segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
-            segments_list = list(segments)
-            
-            for seg in segments_list:
-                seg_start = float(seg.start)
-                # Collect sentence/segment starting points that leave enough room for at least a 15s clip
+            for segment in segments:
+                seg_start = float(segment.start)
                 if seg_start + 15.0 <= duration:
-                    sentence_starts.append(seg_start)
+                    segment_starts.append(seg_start)
 
-                if hasattr(seg, "words") and seg.words:
-                    for w in seg.words:
+                if hasattr(segment, "words") and segment.words:
+                    for w in segment.words:
                         raw_w = w.word.strip()
                         clean_w = re.sub(r'[^a-zA-Z0-9\$\'\,\s\?\!]', '', raw_w).strip()
                         if clean_w:
@@ -138,22 +134,20 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
-    # 2. Pick a random sentence start point (or fallback to 0.0 if video is too short)
+    # Pick a random sentence start point if available, otherwise default to 0.0
     start_time = 0.0
-    if sentence_starts:
-        start_time = random.choice(sentence_starts)
+    if segment_starts:
+        start_time = random.choice(segment_starts)
 
-    # 3. Determine dynamic clip duration between 15s and 180s (3 mins) based on remaining video length
+    # Calculate remaining duration from the chosen random start point (between 15s and 45s)
     remaining_time = duration - start_time
-    if remaining_time <= 15.0:
+    if remaining_time < 15.0:
         start_time = 0.0
         remaining_time = duration
+    
+    clip_duration = min(remaining_time, 45.0)
 
-    # Aim for a natural clip length (e.g., between 30s and 60s, or up to 180s if available)
-    target_natural_len = random.uniform(30.0, min(90.0, remaining_time))
-    clip_duration = min(remaining_time, max(15.0, min(180.0, target_natural_len)))
-
-    # Filter words to the chosen random time window and normalize timestamps relative to clip start
+    # Filter words to only those within our randomized window and shift timestamps to 0.0 base
     windowed_words = [w for w in raw_word_list if start_time <= w["start"] < (start_time + clip_duration)]
     for w in windowed_words:
         w["start"] = max(0.0, w["start"] - start_time)
