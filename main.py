@@ -2,11 +2,11 @@ import os
 import re
 import glob
 import subprocess
+import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 
 app = FastAPI()
@@ -22,17 +22,17 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_event():
     try:
-        subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api"], check=True)
-        print("SUCCESS: Upgraded packages on startup.")
+        subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api", "requests"], check=True)
+        print("SUCCESS: Dependencies verified.")
     except Exception as e:
-        print(f"WARNING: Package upgrade notice: {e}")
+        print(f"Startup notice: {e}")
 
 class ClipRequest(BaseModel):
     url: str
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (iOS Client Engine)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Active Bridge Mode)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -63,7 +63,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_id = extract_video_id(request.url)
 
-    # 1. Fetch timed transcripts robustly
+    # 1. Fetch timed transcripts with comprehensive fallback handling
     word_timed_list = []
     fetched_entries = None
     try:
@@ -148,7 +148,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Character-Based Chunking
+    # 3. Precision Character-Based Chunking (Max 22 chars per line)
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -206,28 +206,43 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download video using clean iOS client emulation without cookie file conflicts
-    ydl_opts_video = {
-        'format': 'best[ext=mp4]/best',
-        'outtmpl': raw_video_path,
-        'quiet': True,
-        'geo_bypass': True,
-        'extractor_args': {'youtube': {'player_client': ['ios']}},
-    }
-
+    # 4. Resolve and stream raw video via media bridge API
+    media_url = None
     try:
-        with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
-            ydl.download([request.url])
+        api_payload = {'url': request.url, 'vCodec': 'h264', 'vQuality': '720'}
+        api_headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+        r_api = requests.post('https://api.cobalt.tools/api/json', json=api_payload, headers=api_headers, timeout=10)
+        if r_api.status_code == 200:
+            data = r_api.json()
+            media_url = data.get('url') or data.get('picker', [{}])[0].get('url')
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"YouTube download failed: {str(e)}")
+        print(f"Bridge resolver notice: {e}")
 
-    downloaded_files = glob.glob("/tmp/raw_download.*")
-    if downloaded_files:
-        actual_raw_video = downloaded_files[0]
-    else:
-        raise HTTPException(status_code=500, detail="Failed to locate downloaded video source.")
+    # Fallback to direct download attempt if bridge is busy
+    if not media_url:
+        try:
+            import yt_dlp
+            ydl_opts = {'format': 'best[ext=mp4]/best', 'outtmpl': raw_video_path, 'quiet': True}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([request.url])
+        except Exception as ex:
+            raise HTTPException(status_code=502, detail=f"All download routes blocked by YouTube datacenter restrictions: {str(ex)}")
 
-    # 5. Render vertical clip (1080x1920) with Asap Extra Bold subtitles
+    if media_url:
+        try:
+            with requests.get(media_url, stream=True, timeout=25) as r_stream:
+                r_stream.raise_for_status()
+                with open(raw_video_path, 'wb') as f_out:
+                    for chunk in r_stream.iter_content(chunk_size=8192):
+                        if chunk:
+                            f_out.write(chunk)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to pull media stream from bridge: {str(e)}")
+
+    if not os.path.exists(raw_video_path) or os.path.getsize(raw_video_path) == 0:
+        raise HTTPException(status_code=500, detail="Downloaded video file is missing or empty.")
+
+    # 5. Render vertical video (1080x1920) with Asap ExtraBold subtitles at y=1180
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -252,7 +267,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         "ffmpeg", "-y",
         "-ss", str(start_time),
         "-to", str(end_time),
-        "-i", actual_raw_video,
+        "-i", raw_video_path,
         "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
