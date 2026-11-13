@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-app = FastAPI(title="ClipForge AI Ultimate Engine", version="3.1.0")
+app = FastAPI(title="ClipForge AI Ultimate Engine", version="3.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,7 +67,6 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    # Get exact video duration
     duration = 30.0
     try:
         probe_cmd = [
@@ -84,7 +83,6 @@ async def upload_and_clip(
     font_file = ensure_heavy_font()
     clip_duration = min(duration, 35.0)
 
-    # Dynamic subtitle script mapped proportionally across the entire clip duration
     script_phrases = [
         "I BET THE GREATEST ATHLETES",
         "ONE HUNDRED THOUSAND DOLLARS",
@@ -100,7 +98,6 @@ async def upload_and_clip(
         "WILL WIN EVERYTHING"
     ]
 
-    # Distribute phrases evenly across the clip duration to guarantee zero sync drift
     chunked_subtitles = []
     total_phrases = len(script_phrases)
     time_per_phrase = clip_duration / total_phrases
@@ -114,7 +111,6 @@ async def upload_and_clip(
             "text": phrase
         })
 
-    # Render vertical video (1080x1920) with bold Montserrat-Black font at size 52, y=1160
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -165,4 +161,4 @@ async def upload_and_clip(
     if background_tasks:
         background_tasks.add_task(cleanup)
 
-    return FileResponse(output_path, media_type="video/mp4", filename="vertical_clip.mp4") filename="vertical_clip.mp4")
+    return FileResponse(output_path, media_type="video/mp4", filename="vertical_clip.mp4")
