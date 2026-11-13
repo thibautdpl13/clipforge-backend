@@ -105,7 +105,9 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Subtitle extraction with cookies and EJS remote component solver enabled
+    proxy_url = os.environ.get("HTTP_PROXY", "").strip()
+
+    # 1. Subtitle extraction with proxy and cookie routing
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -113,9 +115,10 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
-        'remote_components': {'ejs': 'github'},
         'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
     }
+    if proxy_url:
+        ydl_opts_sub['proxy'] = proxy_url
     if os.path.exists(COOKIES_PATH):
         ydl_opts_sub['cookiefile'] = COOKIES_PATH
 
@@ -235,15 +238,16 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video with cookies and EJS challenge solver
+    # 4. Download source video with proxy and cookie routing
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'remote_components': {'ejs': 'github'},
         'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
     }
+    if proxy_url:
+        ydl_opts_video['proxy'] = proxy_url
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
 
