@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.4.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +55,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Stable Transcription Engine",
+        "service": "ClipForge Stable Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
