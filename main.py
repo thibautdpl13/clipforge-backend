@@ -19,9 +19,9 @@ app.add_middleware(
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Exact Transcript Sync Engine)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Precise Cut & Sync Engine)"}
 
-HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
+HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this", "guess", "here"}
 
 def extract_video_id(url: str) -> str:
     patterns = [
@@ -76,12 +76,13 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    # 2. Fetch real transcript from YouTube API if URL provided
+    # 2. Fetch real transcript from YouTube API
     word_timed_list = []
     fetched_entries = None
     
-    if url.strip():
-        video_id = extract_video_id(url)
+    clean_url = url.strip()
+    if clean_url:
+        video_id = extract_video_id(clean_url)
         try:
             try:
                 fetched_entries = YouTubeTranscriptApi.get_transcript(video_id)
@@ -94,7 +95,7 @@ async def upload_and_clip(
                     except Exception:
                         continue
         except Exception as e:
-            print(f"Transcript fetch notice: {e}")
+            print(f"Transcript fetch error: {e}")
 
     if fetched_entries:
         for entry in fetched_entries:
@@ -113,23 +114,19 @@ async def upload_and_clip(
                     word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
 
     if not word_timed_list:
-        fallback_phrases = ["CLIPFORGE AI", "DIRECT UPLOAD MODE", "PERFECT VERTICAL CLIP"]
-        current_t = 0.0
-        for phrase in fallback_phrases * 10:
-            for w in phrase.split():
-                word_timed_list.append({"start": current_t, "end": current_t + 0.35, "text": w})
-                current_t += 0.35
-            current_t += 0.5
+        raise HTTPException(status_code=400, detail="Could not fetch YouTube transcript. Please ensure the YouTube URL is provided and valid.")
 
-    # 3. Viral Hook & Continuous Window Scoring Engine
-    best_start = None
-    best_end = None
+    # 3. Intelligent Viral Hook Scoring Engine (Avoids starting at 0.0 unless it's the best hook)
+    best_start = word_timed_list[0]["start"]
+    best_end = word_timed_list[-1]["end"]
     highest_score = -1.0
+
+    target_clip_length = min(35.0, duration) # aim for ~30-35s viral sweet spot
 
     for i, w in enumerate(word_timed_list):
         win_start = w["start"]
-        if win_start > duration - 10:
-            continue
+        if win_start > duration - 15:
+            break
 
         full_window_text = ""
         win_end = win_start
@@ -142,32 +139,31 @@ async def upload_and_clip(
             win_end = wj["end"]
             length = win_end - win_start
 
-            if length < 10:
+            if length < 15:
                 continue
             if length > 45:
                 break
 
             density = char_count / length
             has_hook = any(hw in wj["text"].lower() for hw in HOOK_WORDS) or "?" in full_window_text
-            start_bonus = 1.8 if has_hook else 1.0
-            viral_score = density * start_bonus
+            hook_bonus = 2.5 if has_hook else 1.0
+            
+            # Prefer clips closest to target length
+            length_penalty = abs(length - target_clip_length) * 0.02
+            viral_score = (density * hook_bonus) - length_penalty
 
             if viral_score > highest_score:
                 highest_score = viral_score
                 best_start = win_start
                 best_end = win_end
 
-    if best_start is None or best_end is None:
-        best_start = 0.0
-        best_end = min(40.0, duration)
-
-    start_time = max(0.0, round(best_start - 0.2, 2))
-    end_time = round(min(duration, best_end + 0.4), 2)
+    start_time = max(0.0, round(best_start, 2))
+    end_time = round(min(duration, best_end), 2)
 
     # 4. Precision Character-Based Chunking with Absolute Timestamp Offsetting
     clip_words = [
         w for w in word_timed_list 
-        if w["end"] > best_start and w["start"] < best_end
+        if w["end"] >= best_start and w["start"] <= best_end
     ]
 
     raw_chunks = []
@@ -183,8 +179,8 @@ async def upload_and_clip(
         if not w_text:
             continue
             
-        rel_start = w["start"] - best_start
-        rel_end = w["end"] - best_start
+        rel_start = max(0.0, w["start"] - best_start)
+        rel_end = max(rel_start + 0.2, w["end"] - best_start)
 
         if not current_chunk_words:
             chunk_start_time = rel_start
@@ -192,8 +188,8 @@ async def upload_and_clip(
         if current_chars + len(w_text) + 1 > MAX_CHARS_PER_LINE and current_chunk_words:
             chunk_text = " ".join(current_chunk_words)
             raw_chunks.append({
-                "start": max(0.0, chunk_start_time),
-                "end": max(chunk_start_time + 0.2, chunk_end_time),
+                "start": chunk_start_time,
+                "end": chunk_end_time,
                 "text": chunk_text
             })
             current_chunk_words = [w_text]
@@ -208,8 +204,8 @@ async def upload_and_clip(
     if current_chunk_words:
         chunk_text = " ".join(current_chunk_words)
         raw_chunks.append({
-            "start": max(0.0, chunk_start_time),
-            "end": max(chunk_start_time + 0.2, chunk_end_time),
+            "start": chunk_start_time,
+            "end": chunk_end_time,
             "text": chunk_text
         })
 
@@ -218,10 +214,9 @@ async def upload_and_clip(
         start_t = rc["start"]
         end_t = rc["end"]
         if i + 1 < len(raw_chunks):
-            next_start = raw_chunks[i + 1]["start"]
-            end_t = next_start
+            end_t = raw_chunks[i + 1]["start"] # transition right when next chunk starts
         else:
-            end_t = rc["end"] + 1.0
+            end_t = rc["end"] + 0.8
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
