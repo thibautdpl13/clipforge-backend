@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Elite Cyan Highlight Engine", version="13.0.0")
+app = FastAPI(title="ClipForge AI Elite Engine", version="10.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +55,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Elite Cyan Highlight Engine",
+        "service": "ClipForge Elite Transcription Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
@@ -121,7 +121,14 @@ async def upload_and_clip(
     model = get_whisper_model()
     if model and os.path.exists(audio_wav_path):
         try:
-            segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
+            segments, _ = model.transcribe(
+                audio_wav_path,
+                word_timestamps=True,
+                beam_size=5,
+                language="en",
+                vad_filter=True,
+                initial_prompt="If this couple can lose 150 lbs before their wedding day, they win $250,000."
+            )
             for segment in segments:
                 if hasattr(segment, "words") and segment.words:
                     for w in segment.words:
@@ -146,31 +153,27 @@ async def upload_and_clip(
 
     # Intelligent Word Grouping into Reader-Friendly Chunks (Max 3-4 words)
     chunked_subtitles = []
-    current_chunk_words = []
+    current_chunk = []
     chunk_start = None
 
     for w in word_timed_list:
-        if not current_chunk_words:
+        if not current_chunk:
             chunk_start = w["start"]
-        current_chunk_words.append(w)
+        current_chunk.append(w["text"])
         
-        phrase_text = " ".join([cw["text"] for cw in current_chunk_words])
-        if len(current_chunk_words) >= 3 or len(phrase_text) > 16:
+        if len(current_chunk) >= 3 or len(" ".join(current_chunk)) > 16:
             chunked_subtitles.append({
                 "start": round(chunk_start, 2),
                 "end": round(w["end"], 2),
-                "text": phrase_text,
-                "words": list(current_chunk_words)
+                "text": " ".join(current_chunk)
             })
-            current_chunk_words = []
+            current_chunk = []
 
-    if current_chunk_words:
-        phrase_text = " ".join([cw["text"] for cw in current_chunk_words])
+    if current_chunk:
         chunked_subtitles.append({
             "start": round(chunk_start, 2),
             "end": round(word_timed_list[-1]["end"], 2),
-            "text": phrase_text,
-            "words": list(current_chunk_words)
+            "text": " ".join(current_chunk)
         })
 
     vf_filters = [
@@ -178,48 +181,18 @@ async def upload_and_clip(
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
     ]
 
-    CHAR_WIDTH_PX = 27  # Average character width for Montserrat-Black at 52pt
-
-    for chunk in chunked_subtitles:
-        safe_chunk_text = chunk["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
-        
-        # 1. Draw base white text for the entire phrase group
-        base_draw = (
-            f"drawtext=text='{safe_chunk_text}':"
+    for sub in chunked_subtitles:
+        safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
+        draw_filter = (
+            f"drawtext=text='{safe_text}':"
             f"fontfile={font_file}:"
             f"fontsize=52:fontcolor=white:"
             f"borderw=5:bordercolor=black:"
             f"shadowx=2:shadowy=2:shadowcolor=black@1.0:"
             f"x=(w-text_w)/2:y=1160:"
-            f"enable='between(t,{chunk['start']},{chunk['end']})'"
+            f"enable='between(t,{sub['start']},{sub['end']})'"
         )
-        vf_filters.append(base_draw)
-
-        # 2. Layer active cyan rectangular rounded box over the word being spoken in the moment
-        current_offset = 0
-        for w in chunk["words"]:
-            safe_w = w["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
-            idx = chunk["text"].find(w["text"], current_offset)
-            if idx == -1:
-                idx = current_offset
-            
-            chars_before = chunk["text"][:idx]
-            left_offset_px = len(chars_before) * CHAR_WIDTH_PX
-            total_chunk_px = len(chunk["text"]) * CHAR_WIDTH_PX
-            
-            x_expr = f"(w-{total_chunk_px})/2+{left_offset_px}"
-            
-            highlight_draw = (
-                f"drawtext=text='{safe_w}':"
-                f"fontfile={font_file}:"
-                f"fontsize=52:fontcolor=white:"
-                f"box=1:boxcolor=0x00E5FF@1.0:boxborderw=10:"
-                f"borderw=3:bordercolor=black:"
-                f"x={x_expr}:y=1160:"
-                f"enable='between(t,{w['start']},{w['end']})'"
-            )
-            vf_filters.append(highlight_draw)
-            current_offset = idx + len(w["text"])
+        vf_filters.append(draw_filter)
 
     video_filter = ",".join(vf_filters)
 
