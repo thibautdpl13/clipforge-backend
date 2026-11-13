@@ -105,7 +105,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             except Exception:
                 pass
 
-    # 1. Subtitle extraction using cookies (Node.js challenge solver enabled via environment variable)
+    # 1. Subtitle extraction using TV/embedded client emulation to bypass IP block/403 errors
     ydl_opts_sub = {
         'skip_download': True,
         'writesubtitles': True,
@@ -113,7 +113,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'subtitlesformat': 'vtt',
         'outtmpl': '/tmp/sub',
         'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+        'extractor_args': {'youtube': {'player_client': ['tv', 'tv_embedded']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_sub['cookiefile'] = COOKIES_PATH
@@ -234,13 +234,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download video using robust format fallback
+    # 4. Download video using TV/embedded player client emulation
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+        'extractor_args': {'youtube': {'player_client': ['tv', 'tv_embedded']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
