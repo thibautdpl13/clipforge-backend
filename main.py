@@ -19,28 +19,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-COOKIES_PATH = "/tmp/cookies.txt"
-
 @app.on_event("startup")
 def startup_event():
-    cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
-    if cookie_content:
-        cookie_content = cookie_content.replace("\r\n", "\n")
-        if not cookie_content.startswith("# Netscape"):
-            cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
-            
-        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
-            f.write(cookie_content)
-        print(f"SUCCESS: Loaded cookies into {COOKIES_PATH}")
-    else:
-        print("CRITICAL WARNING: YOUTUBE_COOKIES environment variable is missing or empty on Render!")
+    try:
+        subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api"], check=True)
+        print("SUCCESS: Upgraded packages on startup.")
+    except Exception as e:
+        print(f"WARNING: Package upgrade notice: {e}")
 
 class ClipRequest(BaseModel):
     url: str
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (EJS Ready)"}
+    return {"status": "running", "service": "ClipForge AI Backend (iOS Client Mode)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -71,24 +63,36 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_id = extract_video_id(request.url)
 
-    # 1. Fetch timed transcripts robustly
+    # 1. Fetch timed transcripts using the correct object/instance pattern
     word_timed_list = []
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt'])
-        for entry in transcript_list:
-            start = entry.get('start', 0.0)
-            dur = entry.get('duration', 2.0)
-            text = entry.get('text', '').replace('\n', ' ')
-            words = text.split()
-            if not words:
+        # Fetch transcript using the list manager for maximum version compatibility
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        fetched_entries = None
+        
+        # Try finding English first, or fallback to the first available language
+        for t in transcript_list:
+            try:
+                fetched_entries = t.fetch()
+                break
+            except Exception:
                 continue
-            per_word = dur / len(words)
-            for idx, w in enumerate(words):
-                clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
-                if clean_w:
-                    w_start = start + (idx * per_word)
-                    w_end = w_start + per_word
-                    word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
+
+        if fetched_entries:
+            for entry in fetched_entries:
+                start = entry.get('start', 0.0)
+                dur = entry.get('duration', 2.0)
+                text = entry.get('text', '').replace('\n', ' ')
+                words = text.split()
+                if not words:
+                    continue
+                per_word = dur / len(words)
+                for idx, w in enumerate(words):
+                    clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
+                    if clean_w:
+                        w_start = start + (idx * per_word)
+                        w_end = w_start + per_word
+                        word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
     except Exception as e:
         print(f"Transcript fetch notice: {str(e)}")
 
@@ -199,16 +203,14 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using web/mweb clients with cookie auth and Node.js challenge solver
+    # 4. Download source video using iOS client configuration to bypass web n-challenges
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
+        'extractor_args': {'youtube': {'player_client': ['ios']}},
     }
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts_video['cookiefile'] = COOKIES_PATH
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
