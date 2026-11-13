@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import speech_recognition as sr
 
-app = FastAPI(title="ClipForge AI Real Transcription Engine", version="4.0.0")
+app = FastAPI(title="ClipForge AI Universal Engine", version="8.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,7 +41,7 @@ def startup_event():
 
 @app.get("/")
 def health_check() -> Dict[str, Any]:
-    return {"status": "online", "service": "ClipForge Real Transcription Engine", "font": ensure_heavy_font()}
+    return {"status": "online", "service": "ClipForge Universal Engine", "font": ensure_heavy_font()}
 
 @app.post("/upload-and-clip")
 async def upload_and_clip(
@@ -83,7 +83,7 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    clip_duration = min(duration, 40.0)
+    clip_duration = min(duration, 35.0)
 
     # Extract audio track to WAV format for speech recognition
     try:
@@ -96,27 +96,26 @@ async def upload_and_clip(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
-    # Transcribe real audio using speech recognition API
-    full_transcript_text = ""
+    # Transcribe uploaded video audio dynamically
+    transcript_text = ""
     if os.path.exists(audio_wav_path):
         recognizer = sr.Recognizer()
         try:
             with sr.AudioFile(audio_wav_path) as source:
                 audio_data = recognizer.record(source)
-                full_transcript_text = recognizer.recognize_google(audio_data)
+                transcript_text = recognizer.recognize_google(audio_data)
         except Exception:
-            # Fallback if speech recognition encounters silence or network hiccup
-            full_transcript_text = "CLIPFORGE AI REAL UPLOAD MODE"
+            transcript_text = "CLIPFORGE AI UNIVERSAL VIDEO CLIP"
 
     font_file = ensure_heavy_font()
 
-    # Split transcribed text into natural chunk phrases (max ~4-5 words per chunk for fast reading)
-    words = full_transcript_text.upper().split()
+    # Split transcribed words into clean reading chunks dynamically
+    words = transcript_text.upper().split()
     if not words:
-        words = ["CLIPFORGE", "AI", "RENDER"]
+        words = ["CLIPFORGE", "AI", "VERTICAL", "CLIPS"]
 
-    chunks_data = []
-    chunk_size = 5
+    chunked_subtitles = []
+    chunk_size = 4
     total_chunks = max(1, (len(words) + chunk_size - 1) // chunk_size)
     time_per_chunk = clip_duration / total_chunks
 
@@ -126,19 +125,19 @@ async def upload_and_clip(
         chunk_idx = i // chunk_size
         start_t = chunk_idx * time_per_chunk
         end_t = (chunk_idx + 1) * time_per_chunk
-        chunks_data.append({
+        chunked_subtitles.append({
             "start": round(start_t, 2),
             "end": round(end_t, 2),
             "text": phrase
         })
 
-    # Build FFmpeg drawtext filters for Montserrat-Black font
+    # Render vertical video (1080x1920) with Montserrat-Black font at size 52, y=1160
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
     ]
 
-    for sub in chunks_data:
+    for sub in chunked_subtitles:
         safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
         draw_filter = (
             f"drawtext=text='{safe_text}':"
