@@ -19,6 +19,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+COOKIES_PATH = "/tmp/cookies.txt"
+
 @app.on_event("startup")
 def startup_event():
     try:
@@ -27,12 +29,24 @@ def startup_event():
     except Exception as e:
         print(f"WARNING: Package upgrade notice: {e}")
 
+    cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if cookie_content:
+        cookie_content = cookie_content.replace("\r\n", "\n")
+        if not cookie_content.startswith("# Netscape"):
+            cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
+            
+        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+            f.write(cookie_content)
+        print(f"SUCCESS: Loaded cookies into {COOKIES_PATH}")
+    else:
+        print("CRITICAL WARNING: YOUTUBE_COOKIES environment variable is missing on Render!")
+
 class ClipRequest(BaseModel):
     url: str
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Resilient Engine)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Authenticated Mode)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -63,17 +77,20 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_id = extract_video_id(request.url)
 
-    # 1. Fetch timed transcripts using robust list matching
+    # 1. Fetch timed transcripts with robust fallback handling
     word_timed_list = []
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
         fetched_entries = None
-        for t in transcript_list:
-            try:
-                fetched_entries = t.fetch()
-                break
-            except Exception:
-                continue
+        try:
+            fetched_entries = YouTubeTranscriptApi.get_transcript(video_id)
+        except Exception:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            for t in transcript_list:
+                try:
+                    fetched_entries = t.fetch()
+                    break
+                except Exception:
+                    continue
 
         if fetched_entries:
             for entry in fetched_entries:
@@ -200,13 +217,14 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download video via yt-dlp using direct format selector
+    # 4. Download source video using authenticated cookies
     ydl_opts_video = {
         'format': 'best[ext=mp4]/best',
         'outtmpl': raw_video_path,
         'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios']}},
     }
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts_video['cookiefile'] = COOKIES_PATH
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
