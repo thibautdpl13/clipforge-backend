@@ -18,8 +18,8 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_event():
     try:
-        # Verify font and ffmpeg exist
-        print("SUCCESS: ClipForge Upload Engine online.")
+        subprocess.run(["pip", "install", "--upgrade", "python-multipart"], check=True)
+        print("SUCCESS: python-multipart installed.")
     except Exception as e:
         print(f"Startup notice: {e}")
 
@@ -32,7 +32,6 @@ async def upload_and_clip(file: UploadFile = File(...), background_tasks: Backgr
     input_video_path = f"/tmp/{file.filename}"
     output_path = "/tmp/clip_output.mp4"
 
-    # Clean previous temp files
     for f in [input_video_path, output_path]:
         if os.path.exists(f):
             try:
@@ -40,10 +39,9 @@ async def upload_and_clip(file: UploadFile = File(...), background_tasks: Backgr
             except Exception:
                 pass
 
-    # Save uploaded file
     try:
         with open(input_video_path, "wb") as buffer:
-            while chunk := await file.read(1024 * 1024):  # Read in 1MB chunks
+            while chunk := await file.read(1024 * 1024):
                 buffer.write(chunk)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")
@@ -51,8 +49,7 @@ async def upload_and_clip(file: UploadFile = File(...), background_tasks: Backgr
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    # Get video duration using ffprobe
-    duration = 60.0  # default fallback
+    duration = 60.0
     try:
         probe_cmd = [
             "ffprobe", "-v", "error", "-show_entries",
@@ -65,15 +62,12 @@ async def upload_and_clip(file: UploadFile = File(...), background_tasks: Backgr
     except Exception:
         pass
 
-    # Generate professional timed subtitle chunks across the video duration for testing
-    clip_duration = min(duration, 45.0)  # cap preview/clip at 45 seconds
+    clip_duration = min(duration, 45.0)
     chunk_duration = 3.0
     sample_phrases = [
         "CLIPFORGE AI",
         "DIRECT UPLOAD MODE",
-        "BYPASSING YOUTUBE BLOCKS",
         "SMOOTH 1080x1920",
-        "ASAP EXTRABOLD FONT",
         "PERFECT VERTICAL CLIP",
         "READY FOR TIKTOK & SHORTS"
     ]
@@ -88,7 +82,6 @@ async def upload_and_clip(file: UploadFile = File(...), background_tasks: Backgr
         t += chunk_duration
         idx += 1
 
-    # Build FFmpeg video filters for 1080x1920 vertical framing and burnt-in subtitles
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
