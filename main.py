@@ -42,13 +42,16 @@ def startup_event():
             
         with open(COOKIES_PATH, "w", encoding="utf-8") as f:
             f.write(cookie_content)
+        print(f"SUCCESS: Loaded cookies into {COOKIES_PATH}")
+    else:
+        print("CRITICAL WARNING: YOUTUBE_COOKIES environment variable is missing on Render!")
 
 class ClipRequest(BaseModel):
     url: str
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Resilient Stream Mode)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Universal Stream Engine)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -222,12 +225,14 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using embedded player client fallback
+    # 4. Download source video using universal 'best' format with browser headers and cookies
     ydl_opts_video = {
-        'format': 'best[ext=mp4]/best',
+        'format': 'best',
         'outtmpl': raw_video_path,
         'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['web_embedded', 'mweb']}},
+        'geo_bypass': True,
+        'nocheckcertificate': True,
+        'extractor_args': {'youtube': {'player_client': ['web', 'mweb', 'android']}},
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts_video['cookiefile'] = COOKIES_PATH
