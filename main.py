@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Cyan Highlight Engine", version="12.0.0")
+app = FastAPI(title="ClipForge AI Elite Cyan Highlight Engine", version="13.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,14 +55,16 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Cyan Highlight Engine",
+        "service": "ClipForge Elite Cyan Highlight Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
 
 def clean_and_format_text(text: str) -> str:
+    """Fixes number comma spacing and preserves apostrophes."""
     formatted = re.sub(r'(\d)\s*,\s*(\d)', r'\1,\2', text)
-    return formatted.upper()
+    formatted = formatted.upper()
+    return formatted
 
 @app.post("/upload-and-clip")
 async def upload_and_clip(
@@ -90,7 +92,7 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    duration = 45.0
+    duration = 35.0
     try:
         probe_cmd = [
             "ffprobe", "-v", "error", "-show_entries",
@@ -142,15 +144,33 @@ async def upload_and_clip(
 
     font_file = ensure_heavy_font()
 
-    pairs = []
-    for i in range(0, len(word_timed_list), 2):
-        pair_words = word_timed_list[i:i+2]
-        p_start = pair_words[0]["start"]
-        p_end = pair_words[-1]["end"]
-        pairs.append({
-            "start": p_start,
-            "end": max(p_end, p_start + 0.8),
-            "words": pair_words
+    # Intelligent Word Grouping into Reader-Friendly Chunks (Max 3-4 words)
+    chunked_subtitles = []
+    current_chunk_words = []
+    chunk_start = None
+
+    for w in word_timed_list:
+        if not current_chunk_words:
+            chunk_start = w["start"]
+        current_chunk_words.append(w)
+        
+        phrase_text = " ".join([cw["text"] for cw in current_chunk_words])
+        if len(current_chunk_words) >= 3 or len(phrase_text) > 16:
+            chunked_subtitles.append({
+                "start": round(chunk_start, 2),
+                "end": round(w["end"], 2),
+                "text": phrase_text,
+                "words": list(current_chunk_words)
+            })
+            current_chunk_words = []
+
+    if current_chunk_words:
+        phrase_text = " ".join([cw["text"] for cw in current_chunk_words])
+        chunked_subtitles.append({
+            "start": round(chunk_start, 2),
+            "end": round(word_timed_list[-1]["end"], 2),
+            "text": phrase_text,
+            "words": list(current_chunk_words)
         })
 
     vf_filters = [
@@ -158,28 +178,37 @@ async def upload_and_clip(
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
     ]
 
-    for pair in pairs:
-        full_text = " ".join([w["text"] for w in pair["words"]])
-        safe_full = full_text.replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
+    CHAR_WIDTH_PX = 27  # Average character width for Montserrat-Black at 52pt
 
+    for chunk in chunked_subtitles:
+        safe_chunk_text = chunk["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
+        
+        # 1. Draw base white text for the entire phrase group
         base_draw = (
-            f"drawtext=text='{safe_full}':"
+            f"drawtext=text='{safe_chunk_text}':"
             f"fontfile={font_file}:"
             f"fontsize=52:fontcolor=white:"
             f"borderw=5:bordercolor=black:"
             f"shadowx=2:shadowy=2:shadowcolor=black@1.0:"
             f"x=(w-text_w)/2:y=1160:"
-            f"enable='between(t,{pair['start']},{pair['end']})'"
+            f"enable='between(t,{chunk['start']},{chunk['end']})'"
         )
         vf_filters.append(base_draw)
 
-        for idx, w in enumerate(pair["words"]):
+        # 2. Layer active cyan rectangular rounded box over the word being spoken in the moment
+        current_offset = 0
+        for w in chunk["words"]:
             safe_w = w["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
-            if len(pair["words"]) == 2:
-                x_expr = f"(w-text_w)/2 - 120" if idx == 0 else f"(w-text_w)/2 + 120"
-            else:
-                x_expr = f"(w-text_w)/2"
-
+            idx = chunk["text"].find(w["text"], current_offset)
+            if idx == -1:
+                idx = current_offset
+            
+            chars_before = chunk["text"][:idx]
+            left_offset_px = len(chars_before) * CHAR_WIDTH_PX
+            total_chunk_px = len(chunk["text"]) * CHAR_WIDTH_PX
+            
+            x_expr = f"(w-{total_chunk_px})/2+{left_offset_px}"
+            
             highlight_draw = (
                 f"drawtext=text='{safe_w}':"
                 f"fontfile={font_file}:"
@@ -190,6 +219,7 @@ async def upload_and_clip(
                 f"enable='between(t,{w['start']},{w['end']})'"
             )
             vf_filters.append(highlight_draw)
+            current_offset = idx + len(w["text"])
 
     video_filter = ",".join(vf_filters)
 
