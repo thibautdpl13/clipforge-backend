@@ -42,16 +42,13 @@ def startup_event():
             
         with open(COOKIES_PATH, "w", encoding="utf-8") as f:
             f.write(cookie_content)
-        print(f"SUCCESS: Loaded cookies into {COOKIES_PATH}")
-    else:
-        print("CRITICAL WARNING: YOUTUBE_COOKIES environment variable is missing on Render!")
 
 class ClipRequest(BaseModel):
     url: str
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Mobile Client Bypass)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Resilient Stream Mode)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -82,7 +79,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_id = extract_video_id(request.url)
 
-    # 1. Fetch timed transcripts with robust version fallbacks
+    # 1. Fetch timed transcripts with robust fallbacks
     word_timed_list = []
     fetched_entries = None
     try:
@@ -225,13 +222,15 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video bypassing web n-challenges using mobile player client emulation
+    # 4. Download source video using embedded player client fallback
     ydl_opts_video = {
         'format': 'best[ext=mp4]/best',
         'outtmpl': raw_video_path,
         'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
+        'extractor_args': {'youtube': {'player_client': ['web_embedded', 'mweb']}},
     }
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts_video['cookiefile'] = COOKIES_PATH
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
