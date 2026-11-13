@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Smart-Clip Engine", version="11.0.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +55,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Smart-Clip Engine",
+        "service": "ClipForge Stable Transcription Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
@@ -86,7 +86,6 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    # 1. Get total video duration via ffprobe
     duration = 35.0
     try:
         probe_cmd = [
@@ -100,21 +99,19 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    target_clip_len = 35.0
-    start_time = 0.0
+    clip_duration = min(duration, 45.0)
 
-    # Extract full audio WAV for Whisper and analysis
     try:
         extract_cmd = [
             "ffmpeg", "-y", "-i", input_video_path,
+            "-t", str(clip_duration),
             "-ar", "16000", "-ac", "1", audio_wav_path
         ]
         subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
-    # 2. Transcribe full video to get word timestamps across the entire timeline
-    word_timed_list = []
+    raw_word_list = []
     model = get_whisper_model()
     if model and os.path.exists(audio_wav_path):
         try:
@@ -125,7 +122,7 @@ async def upload_and_clip(
                         raw_w = w.word.strip()
                         clean_w = re.sub(r'[^a-zA-Z0-9\$\'\,\s\?\!]', '', raw_w).strip()
                         if clean_w:
-                            word_timed_list.append({
+                            raw_word_list.append({
                                 "start": float(w.start),
                                 "end": float(w.end),
                                 "text": clean_w.upper()
@@ -133,62 +130,31 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
-    # 3. Smart Hook Finder: Find the 35s window with the highest speech density / punctuation excitement
-    if duration > target_clip_len and len(word_timed_list) > 5:
-        best_score = -1
-        # Slide a window across word timestamps in 1-second increments
-        max_possible_start = max(0.0, duration - target_clip_len)
-        t_cursor = 0.0
-        while t_cursor <= max_possible_start:
-            window_end = t_cursor + target_clip_len
-            # Count words and exciting markers in this window
-            window_words = [w for w in word_timed_list if t_cursor <= w["start"] < window_end]
-            score = len(window_words)
-            for w in window_words:
-                if "!" in w["text"] or "?" in w["text"] or "$" in w["text"]:
-                    score += 3  # boost high-stakes words
-            
-            if score > best_score:
-                best_score = score
-                start_time = t_cursor
-            t_cursor += 2.0
-
-    clip_duration = min(target_clip_len, duration - start_time)
-    if clip_duration < 5.0:
-        start_time = 0.0
-        clip_duration = min(target_clip_len, duration)
-
-    # Filter words to only those inside our chosen high-energy time window and normalize timestamps relative to clip start
-    windowed_words = [w for w in word_timed_list if start_time <= w["start"] < (start_time + clip_duration)]
-    for w in windowed_words:
-        w["start"] = max(0.0, w["start"] - start_time)
-        w["end"] = max(0.0, w["end"] - start_time)
-
-    # Merge split number/comma tokens (e.g. "100" and ",000" -> "100,000")
+    # 1. Merge split number/comma tokens (e.g. "100" and ",000" -> "100,000")
     merged_list = []
-    for w in windowed_words:
+    for w in raw_word_list:
         if merged_list and (w["text"].startswith(",") or w["text"] == ","):
             merged_list[-1]["text"] += w["text"]
             merged_list[-1]["end"] = w["end"]
         else:
             merged_list.append(w)
 
-    # Strip useless "A " before dollar amounts
-    final_word_list = []
+    # 2. Strip useless "A " before dollar amounts (e.g., "A $250,000" -> "$250,000")
+    word_timed_list = []
     i = 0
     while i < len(merged_list):
         curr = merged_list[i]
         if curr["text"] == "A" and i + 1 < len(merged_list) and merged_list[i + 1]["text"].startswith("$"):
             next_token = merged_list[i + 1]
             next_token["start"] = curr["start"]
-            final_word_list.append(next_token)
+            word_timed_list.append(next_token)
             i += 2
         else:
-            final_word_list.append(curr)
+            word_timed_list.append(curr)
             i += 1
 
-    if not final_word_list:
-        final_word_list = [
+    if not word_timed_list:
+        word_timed_list = [
             {"start": 0.0, "end": clip_duration, "text": "CLIPFORGE AI"}
         ]
 
@@ -199,7 +165,7 @@ async def upload_and_clip(
     current_chunk = []
     chunk_start = None
 
-    for w in final_word_list:
+    for w in word_timed_list:
         if not current_chunk:
             chunk_start = w["start"]
         current_chunk.append(w["text"])
@@ -215,11 +181,10 @@ async def upload_and_clip(
     if current_chunk:
         chunked_subtitles.append({
             "start": round(chunk_start, 2),
-            "end": round(final_word_list[-1]["end"], 2),
+            "end": round(word_timed_list[-1]["end"], 2),
             "text": " ".join(current_chunk)
         })
 
-    # Render vertical video slice with smart offset start time
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -242,7 +207,6 @@ async def upload_and_clip(
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
-        "-ss", str(start_time),
         "-t", str(clip_duration),
         "-i", input_video_path,
         "-vf", video_filter,
