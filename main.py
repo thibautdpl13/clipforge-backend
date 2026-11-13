@@ -22,13 +22,7 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_event():
     try:
-        if not os.path.exists("/usr/bin/node") and os.path.exists("/usr/bin/nodejs"):
-            os.symlink("/usr/bin/nodejs", "/usr/bin/node")
-    except Exception:
-        pass
-
-    try:
-        subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api", "requests"], check=True)
+        subprocess.run(["pip", "install", "--upgrade", "youtube-transcript-api", "requests"], check=True)
         print("SUCCESS: Dependencies verified.")
     except Exception as e:
         print(f"Startup notice: {e}")
@@ -38,7 +32,7 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Multi-Bridge Rotator)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Invidious Direct Stream Engine)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -212,46 +206,45 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Multi-Instance Bridge Rotator (Bypasses YouTube IP blocks completely)
+    # 4. Resolve video stream via Invidious Instances API Rotation
     media_url = None
-    bridge_endpoints = [
-        "https://api.cobalt.tools/api/json",
-        "https://co.wuk.sh/api/json"
+    invidious_instances = [
+        "https://yewtu.be",
+        "https://invidious.flokinet.to",
+        "https://yt.artemislena.eu"
     ]
-    
-    api_payload = {'url': request.url, 'vCodec': 'h264', 'vQuality': '720'}
-    api_headers = {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
 
-    for endpoint in bridge_endpoints:
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+    for instance in invidious_instances:
         try:
-            r_api = requests.post(endpoint, json=api_payload, headers=api_headers, timeout=8)
-            if r_api.status_code == 200:
-                data = r_api.json()
-                media_url = data.get('url') or data.get('picker', [{}])[0].get('url')
-                if media_url:
-                    break
+            api_url = f"{instance}/api/v1/videos/{video_id}"
+            r = requests.get(api_url, headers=headers, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                formats = data.get("formatStreams", [])
+                if formats:
+                    media_url = formats[-1].get("url")
+                    if media_url:
+                        break
         except Exception as e:
-            print(f"Bridge {endpoint} notice: {e}")
+            print(f"Invidious instance {instance} notice: {e}")
 
     if not media_url:
-        raise HTTPException(status_code=502, detail="All media bridge endpoints are currently rate-limited. Please retry in 30 seconds.")
+        raise HTTPException(status_code=502, detail="All Invidious stream instances failed to resolve video. Please verify the YouTube URL.")
 
     try:
-        with requests.get(media_url, stream=True, timeout=25) as r_stream:
+        with requests.get(media_url, stream=True, headers=headers, timeout=30) as r_stream:
             r_stream.raise_for_status()
             with open(raw_video_path, 'wb') as f_out:
                 for chunk in r_stream.iter_content(chunk_size=8192):
                     if chunk:
                         f_out.write(chunk)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to stream media from resolved bridge URL: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Failed to stream video from Invidious source: {str(e)}")
 
     if not os.path.exists(raw_video_path) or os.path.getsize(raw_video_path) == 0:
-        raise HTTPException(status_code=500, detail="Downloaded video file is missing or empty.")
+        raise HTTPException(status_code=500, detail="Downloaded video file is empty.")
 
     # 5. Render vertical video (1080x1920) with Asap ExtraBold subtitles at y=1180
     vf_filters = [
