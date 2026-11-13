@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Elite Engine", version="10.2.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,16 +55,10 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Elite Transcription Engine",
+        "service": "ClipForge Stable Transcription Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
-
-def clean_and_format_text(text: str) -> str:
-    """Fixes number comma spacing and preserves apostrophes."""
-    formatted = re.sub(r'(\d)\s*,\s*(\d)', r'\1,\2', text)
-    formatted = formatted.upper()
-    return formatted
 
 @app.post("/upload-and-clip")
 async def upload_and_clip(
@@ -117,32 +111,47 @@ async def upload_and_clip(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
-    word_timed_list = []
+    raw_word_list = []
     model = get_whisper_model()
     if model and os.path.exists(audio_wav_path):
         try:
-            segments, _ = model.transcribe(
-                audio_wav_path,
-                word_timestamps=True,
-                beam_size=5,
-                language="en",
-                vad_filter=True,
-                initial_prompt="If this couple can lose 150 lbs before their wedding day, they win $250,000."
-            )
+            segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
             for segment in segments:
                 if hasattr(segment, "words") and segment.words:
                     for w in segment.words:
                         raw_w = w.word.strip()
-                        clean_word = re.sub(r'[^a-zA-Z0-9\$\'\,\s\?\!]', '', raw_w).strip()
-                        if clean_word:
-                            formatted_word = clean_and_format_text(clean_word)
-                            word_timed_list.append({
+                        clean_w = re.sub(r'[^a-zA-Z0-9\$\'\,\s\?\!]', '', raw_w).strip()
+                        if clean_w:
+                            raw_word_list.append({
                                 "start": float(w.start),
                                 "end": float(w.end),
-                                "text": formatted_word
+                                "text": clean_w.upper()
                             })
         except Exception as e:
             print(f"Whisper transcription error: {e}")
+
+    # 1. Merge split number/comma tokens (e.g. "100" and ",000" -> "100,000")
+    merged_list = []
+    for w in raw_word_list:
+        if merged_list and (w["text"].startswith(",") or w["text"] == ","):
+            merged_list[-1]["text"] += w["text"]
+            merged_list[-1]["end"] = w["end"]
+        else:
+            merged_list.append(w)
+
+    # 2. Strip useless "A " before dollar amounts (e.g., "A $250,000" -> "$250,000")
+    word_timed_list = []
+    i = 0
+    while i < len(merged_list):
+        curr = merged_list[i]
+        if curr["text"] == "A" and i + 1 < len(merged_list) and merged_list[i + 1]["text"].startswith("$"):
+            next_token = merged_list[i + 1]
+            next_token["start"] = curr["start"]
+            word_timed_list.append(next_token)
+            i += 2
+        else:
+            word_timed_list.append(curr)
+            i += 1
 
     if not word_timed_list:
         word_timed_list = [
@@ -189,7 +198,7 @@ async def upload_and_clip(
             f"fontsize=52:fontcolor=white:"
             f"borderw=5:bordercolor=black:"
             f"shadowx=2:shadowy=2:shadowcolor=black@1.0:"
-            f"x=(w-text_w)/2:y=1160:"
+            f"x=(w-text_w)/2:y=1300:"
             f"enable='between(t,{sub['start']},{sub['end']})'"
         )
         vf_filters.append(draw_filter)
