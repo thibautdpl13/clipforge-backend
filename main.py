@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Elite Engine", version="10.1.0")
+app = FastAPI(title="ClipForge AI SkyBlue Highlight Engine", version="11.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,18 +55,14 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Elite Transcription Engine",
+        "service": "ClipForge SkyBlue Highlight Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
 
 def clean_and_format_text(text: str) -> str:
-    """Fixes number comma spacing and preserves apostrophes."""
-    # Fix comma spacing in numbers e.g. "100 , 000" -> "100,000"
     formatted = re.sub(r'(\d)\s*,\s*(\d)', r'\1,\2', text)
-    # Convert to uppercase for creator style
-    formatted = formatted.upper()
-    return formatted
+    return formatted.upper()
 
 @app.post("/upload-and-clip")
 async def upload_and_clip(
@@ -94,7 +90,7 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    duration = 35.0
+    duration = 45.0
     try:
         probe_cmd = [
             "ffprobe", "-v", "error", "-show_entries",
@@ -127,7 +123,6 @@ async def upload_and_clip(
             for segment in segments:
                 if hasattr(segment, "words") and segment.words:
                     for w in segment.words:
-                        # Allow letters, numbers, apostrophes, and commas
                         raw_w = w.word.strip()
                         clean_word = re.sub(r'[^a-zA-Z0-9\$\'\,\s\?\!]', '', raw_w).strip()
                         if clean_word:
@@ -147,48 +142,82 @@ async def upload_and_clip(
 
     font_file = ensure_heavy_font()
 
-    # Intelligent Word Grouping into Reader-Friendly Chunks (Max 3-4 words)
-    chunked_subtitles = []
-    current_chunk = []
-    chunk_start = None
-
+    # Group words into sentences/phrases of ~4-5 words so they display together on screen,
+    # while tracking individual word timings for the sky blue box highlight effect.
+    phrases = []
+    current_phrase_words = []
+    
     for w in word_timed_list:
-        if not current_chunk:
-            chunk_start = w["start"]
-        current_chunk.append(w["text"])
-        
-        if len(current_chunk) >= 3 or len(" ".join(current_chunk)) > 16:
-            chunked_subtitles.append({
-                "start": round(chunk_start, 2),
-                "end": round(w["end"], 2),
-                "text": " ".join(current_chunk)
+        current_phrase_words.append(w)
+        if len(current_phrase_words) >= 5 or w == word_timed_list[-1]:
+            p_start = current_phrase_words[0]["start"]
+            p_end = current_phrase_words[-1]["end"]
+            phrases.append({
+                "start": p_start,
+                "end": max(p_end, p_start + 0.8),
+                "words": list(current_phrase_words)
             })
-            current_chunk = []
-
-    if current_chunk:
-        chunked_subtitles.append({
-            "start": round(chunk_start, 2),
-            "end": round(word_timed_list[-1]["end"], 2),
-            "text": " ".join(current_chunk)
-        })
+            current_phrase_words = []
 
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
     ]
 
-    for sub in chunked_subtitles:
-        safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
-        draw_filter = (
-            f"drawtext=text='{safe_text}':"
+    # For each phrase, draw the full background sentence in white with black border,
+    # then draw the currently active word with the sky blue background box highlight (#00C0FF).
+    for p in phrases:
+        full_phrase_text = " ".join([w["text"] for w in p["words"]])
+        safe_full_text = full_phrase_text.replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
+
+        # 1. Draw base white text for the entire phrase
+        base_draw = (
+            f"drawtext=text='{safe_full_text}':"
             f"fontfile={font_file}:"
             f"fontsize=52:fontcolor=white:"
             f"borderw=5:bordercolor=black:"
             f"shadowx=2:shadowy=2:shadowcolor=black@1.0:"
             f"x=(w-text_w)/2:y=1160:"
-            f"enable='between(t,{sub['start']},{sub['end']})'"
+            f"enable='between(t,{p['start']},{p['end']})'"
         )
-        vf_filters.append(draw_filter)
+        vf_filters.append(base_draw)
+
+        # 2. Layer active sky blue box highlight over each specific word when active
+        for w in p["words"]:
+            safe_word = w["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
+            highlight_draw = (
+                f"drawtext=text='{safe_word}':"
+                f"fontfile={font_file}:"
+                f"fontsize=52:fontcolor=white:"
+                f"box=1:boxcolor=0x00C0FF@1.0:boxborderw=8:"
+                f"borderw=2:bordercolor=black:"
+                f"x=(w-{len(safe_full_text)}*14)/2:y=1160:" # Centered alignment approximation
+                f"enable='between(t,{w['start']},{w['end']})'"
+            )
+            # To ensure precise centering per word, we compute relative positioning or draw dynamically
+            # For robust centering in ffmpeg, let's draw the active word with box at exact computed coordinate
+            pass
+
+    # Let's refine the word highlight filter with precise word positioning using drawtext box
+    # Instead of complex multi-pass, let's build clean individual word highlights:
+    vf_filters = [
+        "scale=1080:1920:force_original_aspect_ratio=decrease",
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+    ]
+
+    # Render word by word with sky blue box when active
+    for w in word_timed_list:
+        safe_w = w["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
+        word_draw = (
+            f"drawtext=text='{safe_w}':"
+            f"fontfile={font_file}:"
+            f"fontsize=52:fontcolor=white:"
+            f"box=1:boxcolor=0x00C0FF@1.0:boxborderw=10:"
+            f"borderw=3:bordercolor=black:"
+            f"x=(w-text_w)/2:y=1160:"
+            f"enable='between(t,{w['start']},{w['end']})'"
+        )
+        vf_filters.append(word_draw)
 
     video_filter = ",".join(vf_filters)
 
