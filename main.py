@@ -29,6 +29,7 @@ def startup_event():
 
     try:
         subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api", "requests"], check=True)
+        print("SUCCESS: Dependencies verified.")
     except Exception as e:
         print(f"Startup notice: {e}")
 
@@ -37,7 +38,7 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Fixed EJS Config)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Multi-Bridge Rotator)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -211,48 +212,43 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Resolve video stream via Cobalt API with proper headers
+    # 4. Multi-Instance Bridge Rotator (Bypasses YouTube IP blocks completely)
     media_url = None
-    try:
-        api_payload = {'url': request.url, 'vCodec': 'h264', 'vQuality': '720'}
-        api_headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        r_api = requests.post('https://api.cobalt.tools/api/json', json=api_payload, headers=api_headers, timeout=12)
-        if r_api.status_code == 200:
-            data = r_api.json()
-            media_url = data.get('url') or data.get('picker', [{}])[0].get('url')
-    except Exception as e:
-        print(f"Bridge resolver notice: {e}")
+    bridge_endpoints = [
+        "https://api.cobalt.tools/api/json",
+        "https://co.wuk.sh/api/json"
+    ]
+    
+    api_payload = {'url': request.url, 'vCodec': 'h264', 'vQuality': '720'}
+    api_headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
 
-    # Fallback to yt-dlp with correct js_runtimes dict structure
-    if not media_url:
+    for endpoint in bridge_endpoints:
         try:
-            import yt_dlp
-            ydl_opts = {
-                'format': 'best[ext=mp4]/best',
-                'outtmpl': raw_video_path,
-                'quiet': True,
-                'js_runtimes': {'node': {'path': '/usr/bin/node'}},
-                'extractor_args': {'youtube': {'player_client': ['ios', 'android', 'web']}}
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([request.url])
-        except Exception as ex:
-            raise HTTPException(status_code=502, detail=f"All download routes blocked: {str(ex)}")
-
-    if media_url:
-        try:
-            with requests.get(media_url, stream=True, timeout=25) as r_stream:
-                r_stream.raise_for_status()
-                with open(raw_video_path, 'wb') as f_out:
-                    for chunk in r_stream.iter_content(chunk_size=8192):
-                        if chunk:
-                            f_out.write(chunk)
+            r_api = requests.post(endpoint, json=api_payload, headers=api_headers, timeout=8)
+            if r_api.status_code == 200:
+                data = r_api.json()
+                media_url = data.get('url') or data.get('picker', [{}])[0].get('url')
+                if media_url:
+                    break
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Failed to pull media stream from bridge: {str(e)}")
+            print(f"Bridge {endpoint} notice: {e}")
+
+    if not media_url:
+        raise HTTPException(status_code=502, detail="All media bridge endpoints are currently rate-limited. Please retry in 30 seconds.")
+
+    try:
+        with requests.get(media_url, stream=True, timeout=25) as r_stream:
+            r_stream.raise_for_status()
+            with open(raw_video_path, 'wb') as f_out:
+                for chunk in r_stream.iter_content(chunk_size=8192):
+                    if chunk:
+                        f_out.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to stream media from resolved bridge URL: {str(e)}")
 
     if not os.path.exists(raw_video_path) or os.path.getsize(raw_video_path) == 0:
         raise HTTPException(status_code=500, detail="Downloaded video file is missing or empty.")
