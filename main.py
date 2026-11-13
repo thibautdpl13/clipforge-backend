@@ -15,14 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-def startup_event():
-    try:
-        subprocess.run(["pip", "install", "--upgrade", "python-multipart"], check=True)
-        print("SUCCESS: python-multipart installed.")
-    except Exception as e:
-        print(f"Startup notice: {e}")
-
 @app.get("/")
 def health_check():
     return {"status": "running", "service": "ClipForge AI Backend (Direct Upload Engine)"}
