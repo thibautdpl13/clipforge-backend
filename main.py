@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.5.0")
+app = FastAPI(title="ClipForge AI Dynamic Smart-Clip Engine", version="11.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +55,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Stable Engine",
+        "service": "ClipForge Dynamic Smart-Clip Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
@@ -86,7 +86,7 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    duration = 35.0
+    duration = 45.0
     try:
         probe_cmd = [
             "ffprobe", "-v", "error", "-show_entries",
@@ -99,12 +99,9 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    clip_duration = min(duration, 45.0)
-
     try:
         extract_cmd = [
             "ffmpeg", "-y", "-i", input_video_path,
-            "-t", str(clip_duration),
             "-ar", "16000", "-ac", "1", audio_wav_path
         ]
         subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -140,21 +137,78 @@ async def upload_and_clip(
             merged_list.append(w)
 
     # 2. Strip useless "A " before dollar amounts (e.g., "A $250,000" -> "$250,000")
-    word_timed_list = []
+    cleaned_word_list = []
     i = 0
     while i < len(merged_list):
         curr = merged_list[i]
         if curr["text"] == "A" and i + 1 < len(merged_list) and merged_list[i + 1]["text"].startswith("$"):
             next_token = merged_list[i + 1]
             next_token["start"] = curr["start"]
-            word_timed_list.append(next_token)
+            cleaned_word_list.append(next_token)
             i += 2
         else:
-            word_timed_list.append(curr)
+            cleaned_word_list.append(curr)
             i += 1
 
-    if not word_timed_list:
-        word_timed_list = [
+    if not cleaned_word_list:
+        cleaned_word_list = [
+            {"start": 0.0, "end": min(duration, 45.0), "text": "CLIPFORGE AI"}
+        ]
+
+    # 3. Smart Dynamic Hook & Duration Selector (15s to 180s, avoids defaulting to start)
+    start_time = 0.0
+    clip_duration = min(duration, 45.0)
+
+    if duration > 15.0 and len(cleaned_word_list) > 5:
+        best_score = -1
+        best_start = 0.0
+        best_len = min(duration, 45.0)
+
+        # Test candidate durations: 30s, 45s, 60s, 90s
+        target_lengths = [30.0, 45.0, 60.0, 90.0]
+        max_possible_duration = min(180.0, duration)
+
+        # Slide start cursor across the timeline in 3-second steps
+        step = max(3.0, duration / 25.0)
+        curr_start = 0.0
+        while curr_start < duration - 15.0:
+            for t_len in target_lengths:
+                if t_len > max_possible_duration:
+                    continue
+                actual_len = min(t_len, duration - curr_start)
+                if actual_len < 15.0:
+                    continue
+                window_end = curr_start + actual_len
+
+                # Score the window based on word count and high-impact markers (!, ?, $)
+                window_words = [w for w in cleaned_word_list if curr_start <= w["start"] < window_end]
+                score = len(window_words)
+                for w in window_words:
+                    if "!" in w["text"] or "?" in w["text"] or "$" in w["text"]:
+                        score += 4
+
+                # Slight penalty for defaulting to the very beginning if there are better hooks later
+                if curr_start == 0.0 and duration > 60.0:
+                    score = int(score * 0.85)
+
+                if score > best_score:
+                    best_score = score
+                    best_start = curr_start
+                    best_len = actual_len
+
+            curr_start += step
+
+        start_time = best_start
+        clip_duration = best_len
+
+    # Filter words to the winning time window and normalize timestamps relative to clip start
+    windowed_words = [w for w in cleaned_word_list if start_time <= w["start"] < (start_time + clip_duration)]
+    for w in windowed_words:
+        w["start"] = max(0.0, w["start"] - start_time)
+        w["end"] = max(0.0, w["end"] - start_time)
+
+    if not windowed_words:
+        windowed_words = [
             {"start": 0.0, "end": clip_duration, "text": "CLIPFORGE AI"}
         ]
 
@@ -165,7 +219,7 @@ async def upload_and_clip(
     current_chunk = []
     chunk_start = None
 
-    for w in word_timed_list:
+    for w in windowed_words:
         if not current_chunk:
             chunk_start = w["start"]
         current_chunk.append(w["text"])
@@ -181,7 +235,7 @@ async def upload_and_clip(
     if current_chunk:
         chunked_subtitles.append({
             "start": round(chunk_start, 2),
-            "end": round(word_timed_list[-1]["end"], 2),
+            "end": round(windowed_words[-1]["end"], 2),
             "text": " ".join(current_chunk)
         })
 
@@ -207,6 +261,7 @@ async def upload_and_clip(
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
+        "-ss", str(start_time),
         "-t", str(clip_duration),
         "-i", input_video_path,
         "-vf", video_filter,
