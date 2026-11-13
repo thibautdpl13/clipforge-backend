@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Dynamic Smart-Clip Engine", version="11.1.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +55,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Dynamic Smart-Clip Engine",
+        "service": "ClipForge Stable Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
@@ -109,13 +109,20 @@ async def upload_and_clip(
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
     raw_word_list = []
+    segment_data = []
     model = get_whisper_model()
     if model and os.path.exists(audio_wav_path):
         try:
             segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
-            for segment in segments:
-                if hasattr(segment, "words") and segment.words:
-                    for w in segment.words:
+            segments_list = list(segments)
+            for seg in segments_list:
+                segment_data.append({
+                    "start": float(seg.start),
+                    "end": float(seg.end),
+                    "text": seg.text
+                })
+                if hasattr(seg, "words") and seg.words:
+                    for w in seg.words:
                         raw_w = w.word.strip()
                         clean_w = re.sub(r'[^a-zA-Z0-9\$\'\,\s\?\!]', '', raw_w).strip()
                         if clean_w:
@@ -155,51 +162,31 @@ async def upload_and_clip(
             {"start": 0.0, "end": min(duration, 45.0), "text": "CLIPFORGE AI"}
         ]
 
-    # 3. Smart Dynamic Hook & Duration Selector (15s to 180s, avoids defaulting to start)
+    # 3. Lightweight Smart Hook & Duration Selector (15s to 180s)
+    # Avoids defaulting to 0.0 if there are later segments, and respects natural speech boundaries.
     start_time = 0.0
     clip_duration = min(duration, 45.0)
 
-    if duration > 15.0 and len(cleaned_word_list) > 5:
+    if duration > 15.0 and len(segment_data) > 1:
+        # Pick the segment with highest text density or exclamation/excitement after the first 3 seconds
+        best_seg_idx = 0
         best_score = -1
-        best_start = 0.0
-        best_len = min(duration, 45.0)
+        for idx, seg in enumerate(segment_data):
+            score = len(seg["text"].split())
+            if "!" in seg["text"] or "?" in seg["text"] or "$" in seg["text"]:
+                score += 5
+            # Prefer moments a bit past the very beginning if available
+            if seg["start"] > 2.0 and score > best_score:
+                best_score = score
+                best_seg_idx = idx
 
-        # Test candidate durations: 30s, 45s, 60s, 90s
-        target_lengths = [30.0, 45.0, 60.0, 90.0]
-        max_possible_duration = min(180.0, duration)
-
-        # Slide start cursor across the timeline in 3-second steps
-        step = max(3.0, duration / 25.0)
-        curr_start = 0.0
-        while curr_start < duration - 15.0:
-            for t_len in target_lengths:
-                if t_len > max_possible_duration:
-                    continue
-                actual_len = min(t_len, duration - curr_start)
-                if actual_len < 15.0:
-                    continue
-                window_end = curr_start + actual_len
-
-                # Score the window based on word count and high-impact markers (!, ?, $)
-                window_words = [w for w in cleaned_word_list if curr_start <= w["start"] < window_end]
-                score = len(window_words)
-                for w in window_words:
-                    if "!" in w["text"] or "?" in w["text"] or "$" in w["text"]:
-                        score += 4
-
-                # Slight penalty for defaulting to the very beginning if there are better hooks later
-                if curr_start == 0.0 and duration > 60.0:
-                    score = int(score * 0.85)
-
-                if score > best_score:
-                    best_score = score
-                    best_start = curr_start
-                    best_len = actual_len
-
-            curr_start += step
-
-        start_time = best_start
-        clip_duration = best_len
+        start_time = max(0.0, segment_data[best_seg_idx]["start"])
+        # Calculate dynamic duration aiming for 30s-60s, bounded between 15s and 180s (3 minutes)
+        remaining_time = duration - start_time
+        desired_len = min(60.0, max(30.0, remaining_time))
+        clip_duration = min(remaining_time, max(15.0, desired_len))
+        if clip_duration > 180.0:
+            clip_duration = 180.0
 
     # Filter words to the winning time window and normalize timestamps relative to clip start
     windowed_words = [w for w in cleaned_word_list if start_time <= w["start"] < (start_time + clip_duration)]
