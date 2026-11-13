@@ -40,7 +40,7 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Production Engine)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Robust Mode)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -71,24 +71,35 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_id = extract_video_id(request.url)
 
-    # 1. Fetch timed transcripts directly via YouTubeTranscriptApi
+    # 1. Fetch timed transcripts safely
     word_timed_list = []
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt'])
-        for entry in transcript_list:
-            start = entry['start']
-            dur = entry['duration']
-            text = entry['text'].replace('\n', ' ')
-            words = text.split()
-            if not words:
-                continue
-            per_word = dur / len(words)
-            for idx, w in enumerate(words):
-                clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
-                if clean_w:
-                    w_start = start + (idx * per_word)
-                    w_end = w_start + per_word
-                    word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
+        # Instantiate or fetch using list/get safely across versions
+        transcript_list = None
+        try:
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt'])
+        except Exception:
+            # Fallback to listing available transcripts if specific languages fail
+            tx_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            for t in tx_list:
+                transcript_list = t.fetch()
+                break
+
+        if transcript_list:
+            for entry in transcript_list:
+                start = entry.get('start', 0.0)
+                dur = entry.get('duration', 2.0)
+                text = entry.get('text', '').replace('\n', ' ')
+                words = text.split()
+                if not words:
+                    continue
+                per_word = dur / len(words)
+                for idx, w in enumerate(words):
+                    clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
+                    if clean_w:
+                        w_start = start + (idx * per_word)
+                        w_end = w_start + per_word
+                        word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
     except Exception as e:
         print(f"Transcript fetch notice: {str(e)}")
 
@@ -141,7 +152,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Character-Based Chunking (Max 22 chars per line)
+    # 3. Precision Character-Based Chunking
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -199,7 +210,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video via yt-dlp using Android Client Emulation
+    # 4. Download source video using yt-dlp Android client without conflicting cookies
     ydl_opts_video = {
         'format': 'bv*+ba/b / best',
         'outtmpl': raw_video_path,
@@ -207,8 +218,6 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         'merge_output_format': 'mp4',
         'extractor_args': {'youtube': {'player_client': ['android']}},
     }
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts_video['cookiefile'] = COOKIES_PATH
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
