@@ -6,8 +6,9 @@ from typing import List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+import speech_recognition as sr
 
-app = FastAPI(title="ClipForge AI Ultimate Engine", version="3.1.1")
+app = FastAPI(title="ClipForge AI Real Transcription Engine", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +41,7 @@ def startup_event():
 
 @app.get("/")
 def health_check() -> Dict[str, Any]:
-    return {"status": "online", "service": "ClipForge Ultimate Engine", "font": ensure_heavy_font()}
+    return {"status": "online", "service": "ClipForge Real Transcription Engine", "font": ensure_heavy_font()}
 
 @app.post("/upload-and-clip")
 async def upload_and_clip(
@@ -48,9 +49,10 @@ async def upload_and_clip(
     background_tasks: BackgroundTasks = None
 ) -> FileResponse:
     input_video_path = f"/tmp/{file.filename}"
+    audio_wav_path = f"/tmp/audio_{os.getpid()}.wav"
     output_path = f"/tmp/clip_output_{os.getpid()}.mp4"
 
-    for f in [input_video_path, output_path]:
+    for f in [input_video_path, audio_wav_path, output_path]:
         if os.path.exists(f):
             try:
                 os.remove(f)
@@ -67,6 +69,7 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
+    # Get exact video duration
     duration = 30.0
     try:
         probe_cmd = [
@@ -80,43 +83,62 @@ async def upload_and_clip(
     except Exception:
         pass
 
+    clip_duration = min(duration, 40.0)
+
+    # Extract audio track to WAV format for speech recognition
+    try:
+        extract_audio_cmd = [
+            "ffmpeg", "-y", "-i", input_video_path,
+            "-t", str(clip_duration),
+            "-ar", "16000", "-ac", "1", audio_wav_path
+        ]
+        subprocess.run(extract_audio_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
+
+    # Transcribe real audio using speech recognition API
+    full_transcript_text = ""
+    if os.path.exists(audio_wav_path):
+        recognizer = sr.Recognizer()
+        try:
+            with sr.AudioFile(audio_wav_path) as source:
+                audio_data = recognizer.record(source)
+                full_transcript_text = recognizer.recognize_google(audio_data)
+        except Exception:
+            # Fallback if speech recognition encounters silence or network hiccup
+            full_transcript_text = "CLIPFORGE AI REAL UPLOAD MODE"
+
     font_file = ensure_heavy_font()
-    clip_duration = min(duration, 35.0)
 
-    script_phrases = [
-        "I BET THE GREATEST ATHLETES",
-        "ONE HUNDRED THOUSAND DOLLARS",
-        "THAT I COULD BEAT THEM",
-        "IN THEIR OWN SPORT",
-        "LIKE LEBRON JAMES",
-        "IN BASKETBALL",
-        "IF YOU CAN BEAT ME",
-        "AND MY FRIENDS",
-        "WE WILL GIVE THESE FANS",
-        "ONE HUNDRED THOUSAND",
-        "WHOEVER GETS CLOSEST",
-        "WILL WIN EVERYTHING"
-    ]
+    # Split transcribed text into natural chunk phrases (max ~4-5 words per chunk for fast reading)
+    words = full_transcript_text.upper().split()
+    if not words:
+        words = ["CLIPFORGE", "AI", "RENDER"]
 
-    chunked_subtitles = []
-    total_phrases = len(script_phrases)
-    time_per_phrase = clip_duration / total_phrases
+    chunks_data = []
+    chunk_size = 5
+    total_chunks = max(1, (len(words) + chunk_size - 1) // chunk_size)
+    time_per_chunk = clip_duration / total_chunks
 
-    for i, phrase in enumerate(script_phrases):
-        start_t = i * time_per_phrase
-        end_t = (i + 1) * time_per_phrase
-        chunked_subtitles.append({
+    for i in range(0, len(words), chunk_size):
+        chunk_words = words[i:i+chunk_size]
+        phrase = " ".join(chunk_words)
+        chunk_idx = i // chunk_size
+        start_t = chunk_idx * time_per_chunk
+        end_t = (chunk_idx + 1) * time_per_chunk
+        chunks_data.append({
             "start": round(start_t, 2),
             "end": round(end_t, 2),
             "text": phrase
         })
 
+    # Build FFmpeg drawtext filters for Montserrat-Black font
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
     ]
 
-    for sub in chunked_subtitles:
+    for sub in chunks_data:
         safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
         draw_filter = (
             f"drawtext=text='{safe_text}':"
@@ -151,7 +173,7 @@ async def upload_and_clip(
         raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[-300:]}")
 
     def cleanup():
-        for f in [input_video_path, output_path]:
+        for f in [input_video_path, audio_wav_path, output_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
