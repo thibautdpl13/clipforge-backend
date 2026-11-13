@@ -6,9 +6,9 @@ from typing import List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-import speech_recognition as sr
+from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Universal Engine", version="8.0.0")
+app = FastAPI(title="ClipForge AI Elite Engine", version="10.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,6 +19,18 @@ app.add_middleware(
 )
 
 FONT_PATH = "/tmp/heavy_font.ttf"
+MODEL_SIZE = "tiny"
+whisper_model = None
+
+def get_whisper_model():
+    global whisper_model
+    if whisper_model is None:
+        try:
+            # Initialize faster-whisper CPU model optimized for low RAM footprint (<300MB RAM)
+            whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+        except Exception as e:
+            print(f"Failed to load Whisper model: {e}")
+    return whisper_model
 
 def ensure_heavy_font():
     if not os.path.exists(FONT_PATH):
@@ -38,10 +50,16 @@ def ensure_heavy_font():
 @app.on_event("startup")
 def startup_event():
     ensure_heavy_font()
+    get_whisper_model()
 
 @app.get("/")
 def health_check() -> Dict[str, Any]:
-    return {"status": "online", "service": "ClipForge Universal Engine", "font": ensure_heavy_font()}
+    return {
+        "status": "online",
+        "service": "ClipForge Elite Transcription Engine",
+        "model": MODEL_SIZE,
+        "font": ensure_heavy_font()
+    }
 
 @app.post("/upload-and-clip")
 async def upload_and_clip(
@@ -69,8 +87,8 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    # Get exact video duration
-    duration = 30.0
+    # Get exact video duration via ffprobe
+    duration = 35.0
     try:
         probe_cmd = [
             "ffprobe", "-v", "error", "-show_entries",
@@ -83,52 +101,68 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    clip_duration = min(duration, 35.0)
+    clip_duration = min(duration, 45.0)
 
-    # Extract audio track to WAV format for speech recognition
+    # Extract clean 16kHz mono audio WAV for Whisper
     try:
-        extract_audio_cmd = [
+        extract_cmd = [
             "ffmpeg", "-y", "-i", input_video_path,
             "-t", str(clip_duration),
             "-ar", "16000", "-ac", "1", audio_wav_path
         ]
-        subprocess.run(extract_audio_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
-    # Transcribe uploaded video audio dynamically
-    transcript_text = ""
-    if os.path.exists(audio_wav_path):
-        recognizer = sr.Recognizer()
+    # Run faster-whisper transcription with precise word-level timestamps
+    word_timed_list = []
+    model = get_whisper_model()
+    if model and os.path.exists(audio_wav_path):
         try:
-            with sr.AudioFile(audio_wav_path) as source:
-                audio_data = recognizer.record(source)
-                transcript_text = recognizer.recognize_google(audio_data)
-        except Exception:
-            transcript_text = "CLIPFORGE AI UNIVERSAL VIDEO CLIP"
+            segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
+            for segment in segments:
+                if hasattr(segment, "words") and segment.words:
+                    for w in segment.words:
+                        clean_word = re.sub(r'[^a-zA-Z0-9\$\s\?\!\,]', '', w.word).strip().upper()
+                        if clean_word:
+                            word_timed_list.append({
+                                "start": float(w.start),
+                                "end": float(w.end),
+                                "text": clean_word
+                            })
+        except Exception as e:
+            print(f"Whisper transcription error: {e}")
+
+    if not word_timed_list:
+        word_timed_list = [
+            {"start": 0.0, "end": clip_duration, "text": "CLIPFORGE ELITE AI ENGINE"}
+        ]
 
     font_file = ensure_heavy_font()
 
-    # Split transcribed words into clean reading chunks dynamically
-    words = transcript_text.upper().split()
-    if not words:
-        words = ["CLIPFORGE", "AI", "VERTICAL", "CLIPS"]
-
+    # Intelligent Word Grouping into Reader-Friendly Chunks (Max 3-4 words per screen flash)
     chunked_subtitles = []
-    chunk_size = 4
-    total_chunks = max(1, (len(words) + chunk_size - 1) // chunk_size)
-    time_per_chunk = clip_duration / total_chunks
+    current_chunk = []
+    chunk_start = None
 
-    for i in range(0, len(words), chunk_size):
-        chunk_words = words[i:i+chunk_size]
-        phrase = " ".join(chunk_words)
-        chunk_idx = i // chunk_size
-        start_t = chunk_idx * time_per_chunk
-        end_t = (chunk_idx + 1) * time_per_chunk
+    for w in word_timed_list:
+        if not current_chunk:
+            chunk_start = w["start"]
+        current_chunk.append(w["text"])
+        
+        if len(current_chunk) >= 3 or len(" ".join(current_chunk)) > 16:
+            chunked_subtitles.append({
+                "start": round(chunk_start, 2),
+                "end": round(w["end"], 2),
+                "text": " ".join(current_chunk)
+            })
+            current_chunk = []
+
+    if current_chunk:
         chunked_subtitles.append({
-            "start": round(start_t, 2),
-            "end": round(end_t, 2),
-            "text": phrase
+            "start": round(chunk_start, 2),
+            "end": round(word_timed_list[-1]["end"], 2),
+            "text": " ".join(current_chunk)
         })
 
     # Render vertical video (1080x1920) with Montserrat-Black font at size 52, y=1160
@@ -159,7 +193,7 @@ async def upload_and_clip(
         "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
-        "-crf", "23",
+        "-crf", "22",
         "-threads", "4",
         "-c:a", "aac",
         "-b:a", "192k",
