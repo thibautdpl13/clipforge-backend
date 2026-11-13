@@ -3,3 +3,4 @@ uvicorn
 requests
 pydantic
 yt-dlp
+youtube-transcript-api

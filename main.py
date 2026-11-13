@@ -2,11 +2,12 @@ import os
 import re
 import glob
 import subprocess
-import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+import yt_dlp
+from youtube_transcript_api import YouTubeTranscriptApi
 
 app = FastAPI()
 
@@ -18,12 +19,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+COOKIES_PATH = "/tmp/cookies.txt"
+
+@app.on_event("startup")
+def startup_event():
+    cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if cookie_content:
+        cookie_content = cookie_content.replace("\r\n", "\n")
+        if not cookie_content.startswith("# Netscape"):
+            cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
+            
+        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+            f.write(cookie_content)
+        print(f"SUCCESS: Loaded cookies into {COOKIES_PATH}")
+    else:
+        print("CRITICAL WARNING: YOUTUBE_COOKIES environment variable is missing or empty on Render!")
+
 class ClipRequest(BaseModel):
     url: str
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Multi-Mirror Mode)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Production Engine)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -40,131 +57,12 @@ def extract_video_id(url: str) -> str:
             return match.group(1)
     return url.strip()
 
-def fetch_media_data(video_id: str):
-    """Tries multiple public Invidious and Piped API instances to fetch video data and stream URLs."""
-    invidious_instances = [
-        "https://invidious.privacydev.net",
-        "https://inv.nadeko.net",
-        "https://invidious.perennialte.ch",
-        "https://vid.priv.au",
-        "https://invidious.nerdvpn.de",
-        "https://yt.artemislabs.org"
-    ]
-
-    piped_instances = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.adminforge.de",
-        "https://pipedapi.ducks.party"
-    ]
-
-    # 1. Try Invidious instances
-    for instance in invidious_instances:
-        try:
-            resp = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=6)
-            if resp.status_code == 200:
-                data = resp.json()
-                format_streams = data.get("formatStreams", [])
-                video_url = None
-                for stream in format_streams:
-                    if "mp4" in stream.get("type", "").lower():
-                        video_url = stream.get("url")
-                        break
-                if not video_url and format_streams:
-                    video_url = format_streams[0].get("url")
-                
-                if video_url:
-                    if video_url.startswith("/"):
-                        video_url = instance + video_url
-                    return data.get("captions", []), video_url
-        except Exception:
-            continue
-
-    # 2. Try Piped API instances as backup layer
-    for instance in piped_instances:
-        try:
-            resp = requests.get(f"{instance}/streams/{video_id}", timeout=6)
-            if resp.status_code == 200:
-                data = resp.json()
-                video_streams = data.get("videoStreams", [])
-                video_url = None
-                for stream in video_streams:
-                    if stream.get("url") and "mp4" in stream.get("mimeType", "").lower():
-                        video_url = stream.get("url")
-                        break
-                if not video_url and video_streams:
-                    video_url = video_streams[0].get("url")
-
-                subtitles = []
-                for sub in data.get("subtitles", []):
-                    subtitles.append({
-                        "languageCode": sub.get("code", "en"),
-                        "url": sub.get("url")
-                    })
-
-                if video_url:
-                    return subtitles, video_url
-        except Exception:
-            continue
-
-    raise HTTPException(status_code=502, detail="All public Invidious and Piped mirror instances failed to respond.")
-
-def parse_vtt_file(vtt_path):
-    word_timed_list = []
-    if not os.path.exists(vtt_path):
-        return word_timed_list
-        
-    with open(vtt_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    def time_to_seconds(time_str):
-        parts = time_str.strip().split(':')
-        if len(parts) == 3:
-            h, m, s = parts
-            return int(h) * 3600 + int(m) * 60 + float(s.replace(',', '.'))
-        elif len(parts) == 2:
-            m, s = parts
-            return int(m) * 60 + float(s.replace(',', '.'))
-        return 0.0
-
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if "-->" in line:
-            parts = line.split("-->")
-            start_t = time_to_seconds(parts[0])
-            end_t = time_to_seconds(parts.split()[2])
-            
-            i += 1
-            text_lines = []
-            while i < len(lines) and lines[i].strip():
-                clean_line = re.sub(r'<[^>]*>', '', lines[i]).strip()
-                if clean_line:
-                    text_lines.append(clean_line)
-                i += 1
-            
-            full_text = " ".join(text_lines).replace("-", "").strip()
-            if full_text:
-                words = full_text.split()
-                duration = max(0.3, end_t - start_t)
-                time_per_word = duration / max(1, len(words))
-                for w_idx, word in enumerate(words):
-                    clean_word = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', word).strip()
-                    if clean_word:
-                        w_start = start_t + (w_idx * time_per_word)
-                        w_end = w_start + time_per_word
-                        word_timed_list.append({"start": w_start, "end": w_end, "text": clean_word})
-        else:
-            i += 1
-            
-    return word_timed_list
-
 @app.post("/generate-auto-clip")
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
-    sub_vtt_path = "/tmp/sub.vtt"
 
-    for f in [raw_video_path, output_path, sub_vtt_path]:
+    for f in [raw_video_path, output_path]:
         if os.path.exists(f):
             try:
                 os.remove(f)
@@ -172,26 +70,27 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
                 pass
 
     video_id = extract_video_id(request.url)
-    captions, video_stream_url = fetch_media_data(video_id)
 
-    # 1. Download Subtitles (.vtt) if available
-    sub_downloaded = False
-    for cap in captions:
-        if "en" in cap.get("languageCode", "").lower() or not sub_downloaded:
-            cap_url = cap.get("url")
-            if cap_url:
-                try:
-                    sub_resp = requests.get(cap_url, timeout=8)
-                    if sub_resp.status_code == 200:
-                        with open(sub_vtt_path, "w", encoding="utf-8") as sf:
-                            sf.write(sub_resp.text)
-                        sub_downloaded = True
-                        if "en" in cap.get("languageCode", "").lower():
-                            break
-                except Exception:
-                    pass
-
-    word_timed_list = parse_vtt_file(sub_vtt_path) if sub_downloaded else []
+    # 1. Fetch timed transcripts directly via YouTubeTranscriptApi
+    word_timed_list = []
+    try:
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'fr', 'es', 'de', 'it', 'pt'])
+        for entry in transcript_list:
+            start = entry['start']
+            dur = entry['duration']
+            text = entry['text'].replace('\n', ' ')
+            words = text.split()
+            if not words:
+                continue
+            per_word = dur / len(words)
+            for idx, w in enumerate(words):
+                clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
+                if clean_w:
+                    w_start = start + (idx * per_word)
+                    w_end = w_start + per_word
+                    word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
+    except Exception as e:
+        print(f"Transcript fetch notice: {str(e)}")
 
     if not word_timed_list:
         word_timed_list = [
@@ -242,7 +141,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(best_start + 65.0, best_end + 0.4), 2)
 
-    # 3. Precision Character-Based Chunking
+    # 3. Precision Character-Based Chunking (Max 22 chars per line)
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -300,21 +199,30 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download raw video file via streaming
+    # 4. Download source video via yt-dlp using Android Client Emulation
+    ydl_opts_video = {
+        'format': 'bv*+ba/b / best',
+        'outtmpl': raw_video_path,
+        'quiet': True,
+        'merge_output_format': 'mp4',
+        'extractor_args': {'youtube': {'player_client': ['android']}},
+    }
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts_video['cookiefile'] = COOKIES_PATH
+
     try:
-        with requests.get(video_stream_url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            with open(raw_video_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+        with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
+            ydl.download([request.url])
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to stream raw video: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"YouTube download failed completely: {str(e)}")
 
-    if not os.path.exists(raw_video_path) or os.path.getsize(raw_video_path) == 0:
-        raise HTTPException(status_code=500, detail="Downloaded raw video file is empty.")
+    downloaded_files = glob.glob("/tmp/raw_download.*")
+    if downloaded_files:
+        actual_raw_video = downloaded_files[0]
+    else:
+        raise HTTPException(status_code=500, detail="Failed to locate downloaded video source.")
 
-    # 5. Render vertical clip (1080x1920) with Asap Extra Bold subtitles using FFmpeg
+    # 5. Render vertical clip (1080x1920) with Asap Extra Bold subtitles
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -339,7 +247,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         "ffmpeg", "-y",
         "-ss", str(start_time),
         "-to", str(end_time),
-        "-i", raw_video_path,
+        "-i", actual_raw_video,
         "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
@@ -356,7 +264,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[-300:]}")
 
     def cleanup():
-        for f in [raw_video_path, output_path, sub_vtt_path]:
+        for f in [raw_video_path, output_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
