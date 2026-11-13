@@ -23,12 +23,11 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Invidious Mode)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Multi-Mirror Mode)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
 def extract_video_id(url: str) -> str:
-    """Extracts YouTube video ID from various URL formats."""
     patterns = [
         r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
         r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
@@ -41,22 +40,73 @@ def extract_video_id(url: str) -> str:
             return match.group(1)
     return url.strip()
 
-def fetch_invidious_data(video_id: str):
-    """Fetches video metadata and streams from public Invidious instances with fallback."""
-    instances = [
+def fetch_media_data(video_id: str):
+    """Tries multiple public Invidious and Piped API instances to fetch video data and stream URLs."""
+    invidious_instances = [
+        "https://invidious.privacydev.net",
+        "https://inv.nadeko.net",
+        "https://invidious.perennialte.ch",
         "https://vid.priv.au",
         "https://invidious.nerdvpn.de",
-        "https://inv.nadeko.net"
+        "https://yt.artemislabs.org"
     ]
-    
-    for instance in instances:
+
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://pipedapi.ducks.party"
+    ]
+
+    # 1. Try Invidious instances
+    for instance in invidious_instances:
         try:
-            resp = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=10)
+            resp = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=6)
             if resp.status_code == 200:
-                return instance, resp.json()
+                data = resp.json()
+                format_streams = data.get("formatStreams", [])
+                video_url = None
+                for stream in format_streams:
+                    if "mp4" in stream.get("type", "").lower():
+                        video_url = stream.get("url")
+                        break
+                if not video_url and format_streams:
+                    video_url = format_streams[0].get("url")
+                
+                if video_url:
+                    if video_url.startswith("/"):
+                        video_url = instance + video_url
+                    return data.get("captions", []), video_url
         except Exception:
             continue
-    raise HTTPException(status_code=502, detail="All public Invidious mirror instances failed to respond.")
+
+    # 2. Try Piped API instances as backup layer
+    for instance in piped_instances:
+        try:
+            resp = requests.get(f"{instance}/streams/{video_id}", timeout=6)
+            if resp.status_code == 200:
+                data = resp.json()
+                video_streams = data.get("videoStreams", [])
+                video_url = None
+                for stream in video_streams:
+                    if stream.get("url") and "mp4" in stream.get("mimeType", "").lower():
+                        video_url = stream.get("url")
+                        break
+                if not video_url and video_streams:
+                    video_url = video_streams[0].get("url")
+
+                subtitles = []
+                for sub in data.get("subtitles", []):
+                    subtitles.append({
+                        "languageCode": sub.get("code", "en"),
+                        "url": sub.get("url")
+                    })
+
+                if video_url:
+                    return subtitles, video_url
+        except Exception:
+            continue
+
+    raise HTTPException(status_code=502, detail="All public Invidious and Piped mirror instances failed to respond.")
 
 def parse_vtt_file(vtt_path):
     word_timed_list = []
@@ -122,20 +172,16 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
                 pass
 
     video_id = extract_video_id(request.url)
-    instance_url, video_data = fetch_invidious_data(video_id)
+    captions, video_stream_url = fetch_media_data(video_id)
 
     # 1. Download Subtitles (.vtt) if available
-    captions = video_data.get("captions", [])
     sub_downloaded = False
     for cap in captions:
-        # Prefer English or first available caption track
         if "en" in cap.get("languageCode", "").lower() or not sub_downloaded:
             cap_url = cap.get("url")
             if cap_url:
-                if cap_url.startswith("/"):
-                    cap_url = instance_url + cap_url
                 try:
-                    sub_resp = requests.get(cap_url, timeout=10)
+                    sub_resp = requests.get(cap_url, timeout=8)
                     if sub_resp.status_code == 200:
                         with open(sub_vtt_path, "w", encoding="utf-8") as sf:
                             sf.write(sub_resp.text)
@@ -254,25 +300,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Extract direct video stream URL from formatStreams
-    format_streams = video_data.get("formatStreams", [])
-    video_stream_url = None
-    for stream in format_streams:
-        # Look for standard mp4 format streams
-        if "mp4" in stream.get("type", "").lower():
-            video_stream_url = stream.get("url")
-            break
-    
-    if not video_stream_url and format_streams:
-        video_stream_url = format_streams[0].get("url")
-
-    if not video_stream_url:
-        raise HTTPException(status_code=400, detail="No downloadable video streams found via Invidious API.")
-
-    if video_stream_url.startswith("/"):
-        video_stream_url = instance_url + video_stream_url
-
-    # Download raw video file with chunked streaming
+    # 4. Download raw video file via streaming
     try:
         with requests.get(video_stream_url, stream=True, timeout=30) as r:
             r.raise_for_status()
