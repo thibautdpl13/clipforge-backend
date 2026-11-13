@@ -21,7 +21,6 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_event():
-    # Ensure node symlink exists for yt-dlp EJS challenge solver
     try:
         if not os.path.exists("/usr/bin/node") and os.path.exists("/usr/bin/nodejs"):
             os.symlink("/usr/bin/nodejs", "/usr/bin/node")
@@ -30,7 +29,6 @@ def startup_event():
 
     try:
         subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api", "requests"], check=True)
-        print("SUCCESS: Dependencies verified and upgraded.")
     except Exception as e:
         print(f"Startup notice: {e}")
 
@@ -39,7 +37,7 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (EJS Hardened Mode)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Fixed EJS Config)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -229,7 +227,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     except Exception as e:
         print(f"Bridge resolver notice: {e}")
 
-    # Fallback to yt-dlp with explicit node js_runtimes configuration if bridge misses
+    # Fallback to yt-dlp with correct js_runtimes dict structure
     if not media_url:
         try:
             import yt_dlp
@@ -237,7 +235,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
                 'format': 'best[ext=mp4]/best',
                 'outtmpl': raw_video_path,
                 'quiet': True,
-                'js_runtimes': {'node': '/usr/bin/node'},
+                'js_runtimes': {'node': {'path': '/usr/bin/node'}},
                 'extractor_args': {'youtube': {'player_client': ['ios', 'android', 'web']}}
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
