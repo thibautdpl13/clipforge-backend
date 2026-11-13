@@ -23,13 +23,11 @@ COOKIES_PATH = "/tmp/cookies.txt"
 
 @app.on_event("startup")
 def startup_event():
-    # 1. Fix Debian/Ubuntu nodejs vs node binary name mismatch for yt-dlp EJS challenge solver
     try:
         if not os.path.exists("/usr/bin/node") and os.path.exists("/usr/bin/nodejs"):
             os.symlink("/usr/bin/nodejs", "/usr/bin/node")
-            print("SUCCESS: Created symlink /usr/bin/node -> /usr/bin/nodejs")
-    except Exception as e:
-        print(f"Node symlink notice: {e}")
+    except Exception:
+        pass
 
     try:
         subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api"], check=True)
@@ -53,7 +51,7 @@ class ClipRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (EJS Symlinked Mode)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Mobile Client Bypass)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -84,7 +82,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_id = extract_video_id(request.url)
 
-    # 1. Fetch timed transcripts with comprehensive version fallbacks
+    # 1. Fetch timed transcripts with robust version fallbacks
     word_timed_list = []
     fetched_entries = None
     try:
@@ -227,14 +225,13 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video with cookies and JavaScript challenge execution enabled
+    # 4. Download source video bypassing web n-challenges using mobile player client emulation
     ydl_opts_video = {
         'format': 'best[ext=mp4]/best',
         'outtmpl': raw_video_path,
         'quiet': True,
+        'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
     }
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts_video['cookiefile'] = COOKIES_PATH
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
