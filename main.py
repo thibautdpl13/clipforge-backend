@@ -5,7 +5,7 @@ import subprocess
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from youtube_transcript_api import YouTubeTranscriptApi
 
 app = FastAPI()
 
@@ -19,13 +19,27 @@ app.add_middleware(
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Perfect Sync Engine)"}
+    return {"status": "running", "service": "ClipForge AI Backend (Exact Transcript Sync Engine)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
+
+def extract_video_id(url: str) -> str:
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
+        r'(?:embed\/)([0-9A-Za-z_-]{11})',
+        r'(?:shorts\/)([0-9A-Za-z_-]{11})'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return url.strip()
 
 @app.post("/upload-and-clip")
 async def upload_and_clip(
     file: UploadFile = File(...), 
+    url: str = Form(default=""),
     background_tasks: BackgroundTasks = None
 ):
     input_video_path = f"/tmp/{file.filename}"
@@ -62,37 +76,50 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    # 2. Build precise word timings across the entire uploaded video duration
+    # 2. Fetch real transcript from YouTube API if URL provided
     word_timed_list = []
-    sample_transcript_phrases = [
-        "WELCOME BACK TO THE CHANNEL",
-        "TODAY WE ARE DOING SOMETHING INSANE",
-        "LOOK AT THIS RIGHT HERE",
-        "I CANT BELIEVE THIS IS HAPPENING",
-        "WAIT UNTIL YOU SEE WHAT HAPPENS NEXT",
-        "THIS CHANGES EVERYTHING",
-        "LET US JUMP RIGHT INTO IT",
-        "ABSOLUTELY CRAZY STUFF"
-    ]
+    fetched_entries = None
     
-    current_t = 0.0
-    phrase_idx = 0
-    while current_t < duration:
-        phrase = sample_transcript_phrases[phrase_idx % len(sample_transcript_phrases)]
-        words = phrase.split()
-        per_word_dur = 0.35
-        for w in words:
-            word_timed_list.append({
-                "start": current_t,
-                "end": current_t + per_word_dur,
-                "text": w
-            })
-            current_t += per_word_dur
-        current_t += 0.4
-        phrase_idx += 1
+    if url.strip():
+        video_id = extract_video_id(url)
+        try:
+            try:
+                fetched_entries = YouTubeTranscriptApi.get_transcript(video_id)
+            except Exception:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                for t in transcript_list:
+                    try:
+                        fetched_entries = t.fetch()
+                        break
+                    except Exception:
+                        continue
+        except Exception as e:
+            print(f"Transcript fetch notice: {e}")
+
+    if fetched_entries:
+        for entry in fetched_entries:
+            start = entry.get('start', 0.0)
+            dur = entry.get('duration', 2.0)
+            text = entry.get('text', '').replace('\n', ' ')
+            words = text.split()
+            if not words:
+                continue
+            per_word = dur / len(words)
+            for idx, w in enumerate(words):
+                clean_w = re.sub(r'[^a-zA-Z0-9\s\?\!]', '', w).strip()
+                if clean_w:
+                    w_start = start + (idx * per_word)
+                    w_end = w_start + per_word
+                    word_timed_list.append({"start": w_start, "end": w_end, "text": clean_w})
 
     if not word_timed_list:
-        word_timed_list = [{"start": 0.0, "end": duration, "text": "CLIPFORGE AI"}]
+        fallback_phrases = ["CLIPFORGE AI", "DIRECT UPLOAD MODE", "PERFECT VERTICAL CLIP"]
+        current_t = 0.0
+        for phrase in fallback_phrases * 10:
+            for w in phrase.split():
+                word_timed_list.append({"start": current_t, "end": current_t + 0.35, "text": w})
+                current_t += 0.35
+            current_t += 0.5
 
     # 3. Viral Hook & Continuous Window Scoring Engine
     best_start = None
@@ -101,7 +128,7 @@ async def upload_and_clip(
 
     for i, w in enumerate(word_timed_list):
         win_start = w["start"]
-        if win_start < 2.0:
+        if win_start > duration - 10:
             continue
 
         full_window_text = ""
@@ -131,14 +158,13 @@ async def upload_and_clip(
                 best_end = win_end
 
     if best_start is None or best_end is None:
-        best_start = 5.0 if duration > 10 else 0.0
-        best_end = min(best_start + 40.0, duration)
+        best_start = 0.0
+        best_end = min(40.0, duration)
 
     start_time = max(0.0, round(best_start - 0.2, 2))
     end_time = round(min(duration, best_end + 0.4), 2)
 
-    # 4. Precision Character-Based Chunking with ABSOLUTE TIMESTAMP OFFSETTING
-    # Subtracts best_start so captions align perfectly to 0.0 inside the generated clip
+    # 4. Precision Character-Based Chunking with Absolute Timestamp Offsetting
     clip_words = [
         w for w in word_timed_list 
         if w["end"] > best_start and w["start"] < best_end
@@ -157,7 +183,6 @@ async def upload_and_clip(
         if not w_text:
             continue
             
-        # Offset relative to the start of the clip
         rel_start = w["start"] - best_start
         rel_end = w["end"] - best_start
 
