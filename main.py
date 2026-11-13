@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI SkyBlue Highlight Engine", version="11.0.0")
+app = FastAPI(title="ClipForge AI Cyan Highlight Engine", version="12.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,7 +55,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge SkyBlue Highlight Engine",
+        "service": "ClipForge Cyan Highlight Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
@@ -142,82 +142,54 @@ async def upload_and_clip(
 
     font_file = ensure_heavy_font()
 
-    # Group words into sentences/phrases of ~4-5 words so they display together on screen,
-    # while tracking individual word timings for the sky blue box highlight effect.
-    phrases = []
-    current_phrase_words = []
-    
-    for w in word_timed_list:
-        current_phrase_words.append(w)
-        if len(current_phrase_words) >= 5 or w == word_timed_list[-1]:
-            p_start = current_phrase_words[0]["start"]
-            p_end = current_phrase_words[-1]["end"]
-            phrases.append({
-                "start": p_start,
-                "end": max(p_end, p_start + 0.8),
-                "words": list(current_phrase_words)
-            })
-            current_phrase_words = []
+    pairs = []
+    for i in range(0, len(word_timed_list), 2):
+        pair_words = word_timed_list[i:i+2]
+        p_start = pair_words[0]["start"]
+        p_end = pair_words[-1]["end"]
+        pairs.append({
+            "start": p_start,
+            "end": max(p_end, p_start + 0.8),
+            "words": pair_words
+        })
 
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
     ]
 
-    # For each phrase, draw the full background sentence in white with black border,
-    # then draw the currently active word with the sky blue background box highlight (#00C0FF).
-    for p in phrases:
-        full_phrase_text = " ".join([w["text"] for w in p["words"]])
-        safe_full_text = full_phrase_text.replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
+    for pair in pairs:
+        full_text = " ".join([w["text"] for w in pair["words"]])
+        safe_full = full_text.replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
 
-        # 1. Draw base white text for the entire phrase
         base_draw = (
-            f"drawtext=text='{safe_full_text}':"
+            f"drawtext=text='{safe_full}':"
             f"fontfile={font_file}:"
             f"fontsize=52:fontcolor=white:"
             f"borderw=5:bordercolor=black:"
             f"shadowx=2:shadowy=2:shadowcolor=black@1.0:"
             f"x=(w-text_w)/2:y=1160:"
-            f"enable='between(t,{p['start']},{p['end']})'"
+            f"enable='between(t,{pair['start']},{pair['end']})'"
         )
         vf_filters.append(base_draw)
 
-        # 2. Layer active sky blue box highlight over each specific word when active
-        for w in p["words"]:
-            safe_word = w["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
+        for idx, w in enumerate(pair["words"]):
+            safe_w = w["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
+            if len(pair["words"]) == 2:
+                x_expr = f"(w-text_w)/2 - 120" if idx == 0 else f"(w-text_w)/2 + 120"
+            else:
+                x_expr = f"(w-text_w)/2"
+
             highlight_draw = (
-                f"drawtext=text='{safe_word}':"
+                f"drawtext=text='{safe_w}':"
                 f"fontfile={font_file}:"
                 f"fontsize=52:fontcolor=white:"
-                f"box=1:boxcolor=0x00C0FF@1.0:boxborderw=8:"
-                f"borderw=2:bordercolor=black:"
-                f"x=(w-{len(safe_full_text)}*14)/2:y=1160:" # Centered alignment approximation
+                f"box=1:boxcolor=0x00E5FF@1.0:boxborderw=10:"
+                f"borderw=3:bordercolor=black:"
+                f"x={x_expr}:y=1160:"
                 f"enable='between(t,{w['start']},{w['end']})'"
             )
-            # To ensure precise centering per word, we compute relative positioning or draw dynamically
-            # For robust centering in ffmpeg, let's draw the active word with box at exact computed coordinate
-            pass
-
-    # Let's refine the word highlight filter with precise word positioning using drawtext box
-    # Instead of complex multi-pass, let's build clean individual word highlights:
-    vf_filters = [
-        "scale=1080:1920:force_original_aspect_ratio=decrease",
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
-    ]
-
-    # Render word by word with sky blue box when active
-    for w in word_timed_list:
-        safe_w = w["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
-        word_draw = (
-            f"drawtext=text='{safe_w}':"
-            f"fontfile={font_file}:"
-            f"fontsize=52:fontcolor=white:"
-            f"box=1:boxcolor=0x00C0FF@1.0:boxborderw=10:"
-            f"borderw=3:bordercolor=black:"
-            f"x=(w-text_w)/2:y=1160:"
-            f"enable='between(t,{w['start']},{w['end']})'"
-        )
-        vf_filters.append(word_draw)
+            vf_filters.append(highlight_draw)
 
     video_filter = ",".join(vf_filters)
 
