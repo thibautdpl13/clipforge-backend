@@ -2,11 +2,11 @@ import os
 import re
 import glob
 import subprocess
+import requests
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import yt_dlp
 
 app = FastAPI()
 
@@ -18,30 +18,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-COOKIES_PATH = "/tmp/cookies.txt"
-
-@app.on_event("startup")
-def startup_event():
-    cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
-    if cookie_content:
-        cookie_content = cookie_content.replace("\r\n", "\n")
-        if not cookie_content.startswith("# Netscape"):
-            cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
-            
-        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
-            f.write(cookie_content)
-        print(f"SUCCESS: Loaded cookies into {COOKIES_PATH}")
-    else:
-        print("CRITICAL WARNING: YOUTUBE_COOKIES environment variable is missing or empty on Render!")
-
 class ClipRequest(BaseModel):
     url: str
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend"}
+    return {"status": "running", "service": "ClipForge AI Backend (Invidious Mode)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
+
+def extract_video_id(url: str) -> str:
+    """Extracts YouTube video ID from various URL formats."""
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
+        r'(?:embed\/)([0-9A-Za-z_-]{11})',
+        r'(?:shorts\/)([0-9A-Za-z_-]{11})'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return url.strip()
+
+def fetch_invidious_data(video_id: str):
+    """Fetches video metadata and streams from public Invidious instances with fallback."""
+    instances = [
+        "https://vid.priv.au",
+        "https://invidious.nerdvpn.de",
+        "https://inv.nadeko.net"
+    ]
+    
+    for instance in instances:
+        try:
+            resp = requests.get(f"{instance}/api/v1/videos/{video_id}", timeout=10)
+            if resp.status_code == 200:
+                return instance, resp.json()
+        except Exception:
+            continue
+    raise HTTPException(status_code=502, detail="All public Invidious mirror instances failed to respond.")
 
 def parse_vtt_file(vtt_path):
     word_timed_list = []
@@ -97,39 +112,40 @@ def parse_vtt_file(vtt_path):
 def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
     raw_video_path = "/tmp/raw_download.mp4"
     output_path = "/tmp/clip_output.mp4"
+    sub_vtt_path = "/tmp/sub.vtt"
 
-    for f in glob.glob("/tmp/sub.*") + glob.glob("/tmp/raw_download.*") + [output_path]:
+    for f in [raw_video_path, output_path, sub_vtt_path]:
         if os.path.exists(f):
             try:
                 os.remove(f)
             except Exception:
                 pass
 
-    proxy_url = os.environ.get("HTTP_PROXY", "").strip()
+    video_id = extract_video_id(request.url)
+    instance_url, video_data = fetch_invidious_data(video_id)
 
-    # 1. Subtitle extraction with proxy and cookie routing
-    ydl_opts_sub = {
-        'skip_download': True,
-        'writesubtitles': True,
-        'writeautomaticsub': True,
-        'subtitlesformat': 'vtt',
-        'outtmpl': '/tmp/sub',
-        'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
-    }
-    if proxy_url:
-        ydl_opts_sub['proxy'] = proxy_url
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts_sub['cookiefile'] = COOKIES_PATH
+    # 1. Download Subtitles (.vtt) if available
+    captions = video_data.get("captions", [])
+    sub_downloaded = False
+    for cap in captions:
+        # Prefer English or first available caption track
+        if "en" in cap.get("languageCode", "").lower() or not sub_downloaded:
+            cap_url = cap.get("url")
+            if cap_url:
+                if cap_url.startswith("/"):
+                    cap_url = instance_url + cap_url
+                try:
+                    sub_resp = requests.get(cap_url, timeout=10)
+                    if sub_resp.status_code == 200:
+                        with open(sub_vtt_path, "w", encoding="utf-8") as sf:
+                            sf.write(sub_resp.text)
+                        sub_downloaded = True
+                        if "en" in cap.get("languageCode", "").lower():
+                            break
+                except Exception:
+                    pass
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts_sub) as ydl:
-            ydl.extract_info(request.url, download=False)
-    except Exception as e:
-        print(f"Subtitle extraction notice: {str(e)}")
-
-    sub_files = glob.glob("/tmp/sub.*.vtt")
-    word_timed_list = parse_vtt_file(sub_files[0]) if sub_files else []
+    word_timed_list = parse_vtt_file(sub_vtt_path) if sub_downloaded else []
 
     if not word_timed_list:
         word_timed_list = [
@@ -238,32 +254,39 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video with proxy and cookie routing
-    ydl_opts_video = {
-        'format': 'bv*+ba/b / best',
-        'outtmpl': raw_video_path,
-        'quiet': True,
-        'merge_output_format': 'mp4',
-        'extractor_args': {'youtube': {'player_client': ['web', 'mweb']}},
-    }
-    if proxy_url:
-        ydl_opts_video['proxy'] = proxy_url
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts_video['cookiefile'] = COOKIES_PATH
+    # 4. Extract direct video stream URL from formatStreams
+    format_streams = video_data.get("formatStreams", [])
+    video_stream_url = None
+    for stream in format_streams:
+        # Look for standard mp4 format streams
+        if "mp4" in stream.get("type", "").lower():
+            video_stream_url = stream.get("url")
+            break
+    
+    if not video_stream_url and format_streams:
+        video_stream_url = format_streams[0].get("url")
 
+    if not video_stream_url:
+        raise HTTPException(status_code=400, detail="No downloadable video streams found via Invidious API.")
+
+    if video_stream_url.startswith("/"):
+        video_stream_url = instance_url + video_stream_url
+
+    # Download raw video file with chunked streaming
     try:
-        with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
-            ydl.download([request.url])
+        with requests.get(video_stream_url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(raw_video_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"YouTube download failed completely: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to stream raw video: {str(e)}")
 
-    downloaded_files = glob.glob("/tmp/raw_download.*")
-    if downloaded_files:
-        actual_raw_video = downloaded_files[0]
-    else:
-        raise HTTPException(status_code=500, detail="Failed to locate downloaded video source.")
+    if not os.path.exists(raw_video_path) or os.path.getsize(raw_video_path) == 0:
+        raise HTTPException(status_code=500, detail="Downloaded raw video file is empty.")
 
-    # 5. Render vertical clip (1080x1920) with Asap Extra Bold subtitles
+    # 5. Render vertical clip (1080x1920) with Asap Extra Bold subtitles using FFmpeg
     vf_filters = [
         "scale=1080:1920:force_original_aspect_ratio=decrease",
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
@@ -288,7 +311,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         "ffmpeg", "-y",
         "-ss", str(start_time),
         "-to", str(end_time),
-        "-i", actual_raw_video,
+        "-i", raw_video_path,
         "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
@@ -305,7 +328,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[-300:]}")
 
     def cleanup():
-        for f in glob.glob("/tmp/sub.*") + glob.glob("/tmp/raw_download.*") + [output_path]:
+        for f in [raw_video_path, output_path, sub_vtt_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
