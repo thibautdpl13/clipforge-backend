@@ -19,39 +19,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-COOKIES_PATH = "/tmp/cookies.txt"
-
 @app.on_event("startup")
 def startup_event():
     try:
-        if not os.path.exists("/usr/bin/node") and os.path.exists("/usr/bin/nodejs"):
-            os.symlink("/usr/bin/nodejs", "/usr/bin/node")
-    except Exception:
-        pass
-
-    try:
         subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api"], check=True)
-    except Exception:
-        pass
-
-    cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
-    if cookie_content:
-        cookie_content = cookie_content.replace("\r\n", "\n")
-        if not cookie_content.startswith("# Netscape"):
-            cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
-            
-        with open(COOKIES_PATH, "w", encoding="utf-8") as f:
-            f.write(cookie_content)
-        print(f"SUCCESS: Loaded cookies into {COOKIES_PATH}")
-    else:
-        print("CRITICAL WARNING: YOUTUBE_COOKIES environment variable is missing on Render!")
+        print("SUCCESS: Upgraded packages on startup.")
+    except Exception as e:
+        print(f"WARNING: Package upgrade notice: {e}")
 
 class ClipRequest(BaseModel):
     url: str
 
 @app.get("/")
 def health_check():
-    return {"status": "running", "service": "ClipForge AI Backend (Universal Stream Engine)"}
+    return {"status": "running", "service": "ClipForge AI Backend (iOS Client Engine)"}
 
 HOOK_WORDS = {"what", "why", "how", "look", "wait", "bro", "crazy", "insane", "never", "stop", "omg", "right", "yo", "listen", "this"}
 
@@ -82,7 +63,7 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
 
     video_id = extract_video_id(request.url)
 
-    # 1. Fetch timed transcripts with robust fallbacks
+    # 1. Fetch timed transcripts robustly
     word_timed_list = []
     fetched_entries = None
     try:
@@ -225,17 +206,14 @@ def generate_auto_clip(request: ClipRequest, background_tasks: BackgroundTasks):
             
         chunked_subtitles.append({"start": round(start_t, 2), "end": round(end_t, 2), "text": rc["text"]})
 
-    # 4. Download source video using universal 'best' format with browser headers and cookies
+    # 4. Download video using clean iOS client emulation without cookie file conflicts
     ydl_opts_video = {
-        'format': 'best',
+        'format': 'best[ext=mp4]/best',
         'outtmpl': raw_video_path,
         'quiet': True,
         'geo_bypass': True,
-        'nocheckcertificate': True,
-        'extractor_args': {'youtube': {'player_client': ['web', 'mweb', 'android']}},
+        'extractor_args': {'youtube': {'player_client': ['ios']}},
     }
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts_video['cookiefile'] = COOKIES_PATH
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts_video) as ydl:
