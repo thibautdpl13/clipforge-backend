@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.6.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -134,12 +134,12 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
-    # Pick random sentence start and end with duration between 15s and 180s
+    # Random sentence start and end with duration between 15s and 180s
     start_time = 0.0
     clip_duration = min(duration, 45.0)
 
     possible_pairs = []
-    if len(segments_list) >= 1:
+    if segments_list:
         for i in range(len(segments_list)):
             for j in range(i, len(segments_list)):
                 v_start = segments_list[i]["start"]
@@ -153,8 +153,10 @@ async def upload_and_clip(
     elif segments_list:
         start_time = segments_list[0]["start"]
         clip_duration = min(max(15.0, duration - start_time), 180.0)
+    else:
+        start_time = 0.0
+        clip_duration = min(max(15.0, duration), 180.0)
 
-    # Filter words to the selected random window and shift timestamps to start at 0.0
     end_time = start_time + clip_duration
     windowed_words = [w for w in raw_word_list if start_time <= w["start"] < end_time]
     for w in windowed_words:
@@ -236,7 +238,6 @@ async def upload_and_clip(
 
     video_filter = ",".join(vf_filters)
 
-    # Correct FFmpeg command: -ss before -i for speed + yuv420p & faststart to prevent file corruption
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-ss", str(start_time),
