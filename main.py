@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.1")
+app = FastAPI(title="ClipForge AI Stable Engine", version="11.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -134,7 +134,7 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
-    # Random sentence start and end with duration between 15s and 180s
+    # Random sentence start and end with duration strictly between 15s and 180s across the whole video
     start_time = 0.0
     clip_duration = min(duration, 45.0)
 
