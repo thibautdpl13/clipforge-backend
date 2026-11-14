@@ -3,13 +3,14 @@ import re
 import random
 import urllib.request
 import subprocess
+import gc
 from typing import List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Lightweight Engine", version="10.9.3")
+app = FastAPI(title="ClipForge AI Lightweight Engine", version="10.9.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,7 +28,6 @@ def get_whisper_model():
     global whisper_model
     if whisper_model is None:
         try:
-            # Locked to 1 CPU thread to stay well under Render's 512MB RAM limit
             whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=1)
         except Exception as e:
             print(f"Failed to load Whisper model: {e}")
@@ -102,7 +102,6 @@ async def upload_and_clip(
         pass
 
     try:
-        # Optimized: -ar 8000 reduces raw WAV audio memory footprint by 75%
         extract_cmd = [
             "ffmpeg", "-y", "-i", input_video_path,
             "-ar", "8000", "-ac", "1", audio_wav_path
@@ -117,12 +116,13 @@ async def upload_and_clip(
     
     if model and os.path.exists(audio_wav_path):
         try:
-            # vad_filter=True skips silent intervals to save memory and CPU time
+            # chunk_length_s=30 prevents memory spikes on long audio files by processing in blocks
             segments, _ = model.transcribe(
                 audio_wav_path, 
                 word_timestamps=True, 
                 beam_size=1,
                 vad_filter=True,
+                chunk_length_s=30,
                 condition_on_previous_text=False
             )
             for segment in segments:
@@ -142,6 +142,8 @@ async def upload_and_clip(
                             })
         except Exception as e:
             print(f"Whisper transcription error: {e}")
+        finally:
+            gc.collect()
 
     # Random sentence start and end with duration between 15s and 180s
     start_time = 0.0
@@ -274,8 +276,9 @@ async def upload_and_clip(
                     os.remove(f)
                 except Exception:
                     pass
+        gc.collect()
 
     if background_tasks:
         background_tasks.add_task(cleanup)
 
-    return FileResponse(output_path, media_type="video/mp4", filename="vertical_clip.mp4")
+    return FileResponse(output_path, media_type="video/mp4", filename="vertical_clip.mp4")e="vertical_clip.mp4")
