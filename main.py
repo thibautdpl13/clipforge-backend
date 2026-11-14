@@ -258,7 +258,6 @@ async def upload_and_clip(file: UploadFile = File(...)):
 
     job_statuses[task_id] = {"status": "queued"}
 
-    # Start processing in a background thread so the HTTP request returns instantly (0 timeout risk)
     threading.Thread(
         target=process_video_task,
         args=(task_id, input_video_path, audio_wav_path, output_path),
