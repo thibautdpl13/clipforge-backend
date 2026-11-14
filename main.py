@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -263,12 +263,8 @@ async def upload_and_clip(
             if os.path.exists(f):
                 try:
                     os.remove(f)
-                extras = [input_video_path, audio_wav_path, output_path]
-                for x in extras:
-                    if os.path.exists(x):
-                        os.remove(x)
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
     if background_tasks:
         background_tasks.add_task(cleanup)
