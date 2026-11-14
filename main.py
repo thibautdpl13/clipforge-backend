@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.8.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,17 +110,17 @@ async def upload_and_clip(
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
     raw_word_list = []
-    segments_list = []
+    sentence_boundaries = []
     model = get_whisper_model()
     
     if model and os.path.exists(audio_wav_path):
         try:
             segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
             for segment in segments:
-                segments_list.append({
-                    "start": float(segment.start),
-                    "end": float(segment.end)
-                })
+                seg_start = float(segment.start)
+                seg_end = float(segment.end)
+                sentence_boundaries.append((seg_start, seg_end))
+                
                 if hasattr(segment, "words") and segment.words:
                     for w in segment.words:
                         raw_w = w.word.strip()
@@ -138,20 +138,20 @@ async def upload_and_clip(
     start_time = 0.0
     clip_duration = min(duration, 45.0)
 
-    possible_pairs = []
-    if segments_list:
-        for i in range(len(segments_list)):
-            for j in range(i, len(segments_list)):
-                v_start = segments_list[i]["start"]
-                v_end = segments_list[j]["end"]
-                d = v_end - v_start
+    valid_pairs = []
+    if sentence_boundaries:
+        for i in range(len(sentence_boundaries)):
+            for j in range(i, len(sentence_boundaries)):
+                s_start = sentence_boundaries[i][0]
+                s_end = sentence_boundaries[j][1]
+                d = s_end - s_start
                 if 15.0 <= d <= 180.0:
-                    possible_pairs.append((v_start, d))
+                    valid_pairs.append((s_start, d))
 
-    if possible_pairs:
-        start_time, clip_duration = random.choice(possible_pairs)
-    elif segments_list:
-        start_time = segments_list[0]["start"]
+    if valid_pairs:
+        start_time, clip_duration = random.choice(valid_pairs)
+    elif sentence_boundaries:
+        start_time = sentence_boundaries[0][0]
         clip_duration = min(max(15.0, duration - start_time), 180.0)
     else:
         start_time = 0.0
@@ -247,8 +247,6 @@ async def upload_and_clip(
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "22",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
         "-threads", "4",
         "-c:a", "aac",
         "-b:a", "192k",
@@ -265,8 +263,12 @@ async def upload_and_clip(
             if os.path.exists(f):
                 try:
                     os.remove(f)
-                except Exception:
-                    pass
+                extras = [input_video_path, audio_wav_path, output_path]
+                for x in extras:
+                    if os.path.exists(x):
+                        os.remove(x)
+            except Exception:
+                pass
 
     if background_tasks:
         background_tasks.add_task(cleanup)
