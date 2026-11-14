@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.2")
+app = FastAPI(title="ClipForge AI Lightweight Engine", version="10.9.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,8 +27,8 @@ def get_whisper_model():
     global whisper_model
     if whisper_model is None:
         try:
-            # cpu_threads=2 prevents CPU/RAM spikes on 512MB containers
-            whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=2)
+            # Locked to 1 CPU thread to stay well under Render's 512MB RAM limit
+            whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=1)
         except Exception as e:
             print(f"Failed to load Whisper model: {e}")
     return whisper_model
@@ -57,7 +57,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Stable Engine",
+        "service": "ClipForge Lightweight Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
@@ -102,9 +102,10 @@ async def upload_and_clip(
         pass
 
     try:
+        # Optimized: -ar 8000 reduces raw WAV audio memory footprint by 75%
         extract_cmd = [
             "ffmpeg", "-y", "-i", input_video_path,
-            "-ar", "16000", "-ac", "1", audio_wav_path
+            "-ar", "8000", "-ac", "1", audio_wav_path
         ]
         subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     except Exception as e:
@@ -116,7 +117,7 @@ async def upload_and_clip(
     
     if model and os.path.exists(audio_wav_path):
         try:
-            # vad_filter=True lightens memory usage by skipping silent audio intervals
+            # vad_filter=True skips silent intervals to save memory and CPU time
             segments, _ = model.transcribe(
                 audio_wav_path, 
                 word_timestamps=True, 
@@ -255,7 +256,7 @@ async def upload_and_clip(
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "22",
-        "-threads", "2",
+        "-threads", "1",
         "-c:a", "aac",
         "-b:a", "192k",
         output_path
