@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.1")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,7 +27,8 @@ def get_whisper_model():
     global whisper_model
     if whisper_model is None:
         try:
-            whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+            # cpu_threads=2 prevents CPU/RAM spikes on 512MB containers
+            whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=2)
         except Exception as e:
             print(f"Failed to load Whisper model: {e}")
     return whisper_model
@@ -115,7 +116,14 @@ async def upload_and_clip(
     
     if model and os.path.exists(audio_wav_path):
         try:
-            segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
+            # vad_filter=True lightens memory usage by skipping silent audio intervals
+            segments, _ = model.transcribe(
+                audio_wav_path, 
+                word_timestamps=True, 
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False
+            )
             for segment in segments:
                 seg_start = float(segment.start)
                 seg_end = float(segment.end)
@@ -247,7 +255,7 @@ async def upload_and_clip(
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "22",
-        "-threads", "4",
+        "-threads", "2",
         "-c:a", "aac",
         "-b:a", "192k",
         output_path
