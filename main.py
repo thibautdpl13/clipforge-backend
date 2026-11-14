@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Asynchronous Engine", version="11.1.0")
+app = FastAPI(title="ClipForge AI Asynchronous Engine", version="11.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,7 +25,6 @@ FONT_PATH = "/tmp/heavy_font.ttf"
 MODEL_SIZE = "tiny"
 whisper_model = None
 
-# In-memory job status store for the free tier
 job_statuses = {}
 
 def get_whisper_model():
@@ -202,18 +201,19 @@ def process_video_task(task_id: str, input_video_path: str, audio_wav_path: str,
         video_filter = ",".join(vf_filters)
 
         job_statuses[task_id]["progress"] = "Rendering vertical video with FFmpeg..."
+        
+        # FIXED FFPEG COMMAND (Input seeking order fixed to prevent container corruption)
         ffmpeg_cmd = [
             "ffmpeg", "-y",
+            "-i", input_video_path,
             "-ss", str(start_time),
             "-t", str(clip_duration),
-            "-i", input_video_path,
             "-vf", video_filter,
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-crf", "22",
-            "-pix_fmt", "yuv420p",      # Fixes player compatibility / corruption errors
-            "-movflags", "+faststart", # Moves metadata to the start so file plays immediately
-            "-threads", "4",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
             "-c:a", "aac",
             "-b:a", "192k",
             output_path
