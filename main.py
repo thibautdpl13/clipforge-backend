@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Asynchronous Engine", version="11.3.0")
+app = FastAPI(title="ClipForge AI Asynchronous Engine", version="11.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -206,15 +206,14 @@ def process_video_task(task_id: str, input_video_path: str, audio_wav_path: str,
             "-ss", str(start_time),
             "-i", input_video_path,
             "-t", str(clip_duration),
-            "-avoid_negative_ts", "make_zero",
             "-vf", video_filter,
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-crf", "22",
             "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
             "-c:a", "aac",
             "-b:a", "192k",
+            "-movflags", "+faststart",
             output_path
         ]
 
