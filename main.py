@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="11.0.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="11.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -115,7 +115,14 @@ async def upload_and_clip(
     
     if model and os.path.exists(audio_wav_path):
         try:
-            segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
+            # Added vad_filter=True & condition_on_previous_text=False for lightning-fast transcription (prevents timeout / failed to fetch)
+            segments, _ = model.transcribe(
+                audio_wav_path, 
+                word_timestamps=True, 
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False
+            )
             for segment in segments:
                 seg_start = float(segment.start)
                 seg_end = float(segment.end)
