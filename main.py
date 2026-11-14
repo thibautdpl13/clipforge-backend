@@ -1,4 +1,4 @@
- import os
+import os
 import re
 import random
 import urllib.request
@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.5.0")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -100,23 +100,27 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    clip_duration = min(duration, 45.0)
-
     try:
         extract_cmd = [
             "ffmpeg", "-y", "-i", input_video_path,
-            "-t", str(clip_duration), "-ar", "16000", "-ac", "1", audio_wav_path
+            "-ar", "16000", "-ac", "1", audio_wav_path
         ]
         subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
     raw_word_list = []
+    sentence_boundaries = []
     model = get_whisper_model()
+    
     if model and os.path.exists(audio_wav_path):
         try:
             segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
             for segment in segments:
+                seg_start = float(segment.start)
+                seg_end = float(segment.end)
+                sentence_boundaries.append((seg_start, seg_end))
+                
                 if hasattr(segment, "words") and segment.words:
                     for w in segment.words:
                         raw_w = w.word.strip()
@@ -130,9 +134,38 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
+    # Random sentence start and end with duration between 15s and 180s
+    start_time = 0.0
+    clip_duration = min(duration, 45.0)
+
+    valid_pairs = []
+    if sentence_boundaries:
+        for i in range(len(sentence_boundaries)):
+            for j in range(i, len(sentence_boundaries)):
+                s_start = sentence_boundaries[i][0]
+                s_end = sentence_boundaries[j][1]
+                d = s_end - s_start
+                if 15.0 <= d <= 180.0:
+                    valid_pairs.append((s_start, d))
+
+    if valid_pairs:
+        start_time, clip_duration = random.choice(valid_pairs)
+    elif sentence_boundaries:
+        start_time = sentence_boundaries[0][0]
+        clip_duration = min(max(15.0, duration - start_time), 180.0)
+    else:
+        start_time = 0.0
+        clip_duration = min(max(15.0, duration), 180.0)
+
+    end_time = start_time + clip_duration
+    windowed_words = [w for w in raw_word_list if start_time <= w["start"] < end_time]
+    for w in windowed_words:
+        w["start"] = max(0.0, w["start"] - start_time)
+        w["end"] = max(0.0, w["end"] - start_time)
+
     # 1. Merge split number/comma tokens (e.g. "100" and ",000" -> "100,000")
     merged_list = []
-    for w in raw_word_list:
+    for w in windowed_words:
         if merged_list and (w["text"].startswith(",") or w["text"] == ","):
             merged_list[-1]["text"] += w["text"]
             merged_list[-1]["end"] = w["end"]
@@ -206,8 +239,10 @@ async def upload_and_clip(
     video_filter = ",".join(vf_filters)
 
     ffmpeg_cmd = [
-        "ffmpeg", "-y", "-t", str(clip_duration),
+        "ffmpeg", "-y",
+        "-ss", str(start_time),
         "-i", input_video_path,
+        "-t", str(clip_duration),
         "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
