@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.1")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,7 +27,8 @@ def get_whisper_model():
     global whisper_model
     if whisper_model is None:
         try:
-            whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+            # cpu_threads=1 keeps RAM usage strictly flat and low
+            whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=1)
         except Exception as e:
             print(f"Failed to load Whisper model: {e}")
     return whisper_model
@@ -67,10 +68,11 @@ async def upload_and_clip(
     background_tasks: BackgroundTasks = None
 ) -> FileResponse:
     input_video_path = f"/tmp/{file.filename}"
+    slice_video_path = f"/tmp/slice_{os.getpid()}.mp4"
     audio_wav_path = f"/tmp/audio_{os.getpid()}.wav"
     output_path = f"/tmp/clip_output_{os.getpid()}.mp4"
 
-    for f in [input_video_path, audio_wav_path, output_path]:
+    for f in [input_video_path, slice_video_path, audio_wav_path, output_path]:
         if os.path.exists(f):
             try:
                 os.remove(f)
@@ -87,6 +89,7 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
+    # 1. Get full video duration
     duration = 35.0
     try:
         probe_cmd = [
@@ -100,27 +103,59 @@ async def upload_and_clip(
     except Exception:
         pass
 
+    # 2. Pick a random start time anywhere in the video for a 30s-45s clip snippet
+    clip_duration = min(duration, 45.0)
+    max_start = max(0.0, duration - clip_duration)
+    start_time = random.uniform(0.0, max_start) if max_start > 0 else 0.0
+
+    # 3. Quickly slice the video snippet first using FFmpeg (zero RAM usage)
+    try:
+        slice_cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_time),
+            "-i", input_video_path,
+            "-t", str(clip_duration),
+            "-c", "copy",
+            slice_video_path
+        ]
+        res = subprocess.run(slice_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode != 0 or not os.path.exists(slice_video_path) or os.path.getsize(slice_video_path) == 0:
+            # Fallback if stream copy fails
+            slice_cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start_time),
+                "-i", input_video_path,
+                "-t", str(clip_duration),
+                slice_video_path
+            ]
+            subprocess.run(slice_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Video slicing failed: {str(e)}")
+
+    # 4. Extract audio ONLY from this small slice (tiny file size, zero RAM pressure)
     try:
         extract_cmd = [
-            "ffmpeg", "-y", "-i", input_video_path,
+            "ffmpeg", "-y", "-i", slice_video_path,
             "-ar", "16000", "-ac", "1", audio_wav_path
         ]
         subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
+    # 5. Run Whisper on the lightweight slice audio (stays safely under 512MB RAM)
     raw_word_list = []
-    sentence_boundaries = []
     model = get_whisper_model()
     
     if model and os.path.exists(audio_wav_path):
         try:
-            segments, _ = model.transcribe(audio_wav_path, word_timestamps=True, beam_size=1)
+            segments, _ = model.transcribe(
+                audio_wav_path, 
+                word_timestamps=True, 
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False
+            )
             for segment in segments:
-                seg_start = float(segment.start)
-                seg_end = float(segment.end)
-                sentence_boundaries.append((seg_start, seg_end))
-                
                 if hasattr(segment, "words") and segment.words:
                     for w in segment.words:
                         raw_w = w.word.strip()
@@ -134,38 +169,9 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
-    # Random sentence start and end with duration between 15s and 180s
-    start_time = 0.0
-    clip_duration = min(duration, 45.0)
-
-    valid_pairs = []
-    if sentence_boundaries:
-        for i in range(len(sentence_boundaries)):
-            for j in range(i, len(sentence_boundaries)):
-                s_start = sentence_boundaries[i][0]
-                s_end = sentence_boundaries[j][1]
-                d = s_end - s_start
-                if 15.0 <= d <= 180.0:
-                    valid_pairs.append((s_start, d))
-
-    if valid_pairs:
-        start_time, clip_duration = random.choice(valid_pairs)
-    elif sentence_boundaries:
-        start_time = sentence_boundaries[0][0]
-        clip_duration = min(max(15.0, duration - start_time), 180.0)
-    else:
-        start_time = 0.0
-        clip_duration = min(max(15.0, duration), 180.0)
-
-    end_time = start_time + clip_duration
-    windowed_words = [w for w in raw_word_list if start_time <= w["start"] < end_time]
-    for w in windowed_words:
-        w["start"] = max(0.0, w["start"] - start_time)
-        w["end"] = max(0.0, w["end"] - start_time)
-
     # 1. Merge split number/comma tokens (e.g. "100" and ",000" -> "100,000")
     merged_list = []
-    for w in windowed_words:
+    for w in raw_word_list:
         if merged_list and (w["text"].startswith(",") or w["text"] == ","):
             merged_list[-1]["text"] += w["text"]
             merged_list[-1]["end"] = w["end"]
@@ -238,16 +244,15 @@ async def upload_and_clip(
 
     video_filter = ",".join(vf_filters)
 
+    # 6. Final render on the already-sliced video snippet
     ffmpeg_cmd = [
         "ffmpeg", "-y",
-        "-ss", str(start_time),
-        "-i", input_video_path,
-        "-t", str(clip_duration),
+        "-i", slice_video_path,
         "-vf", video_filter,
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "22",
-        "-threads", "4",
+        "-threads", "2",
         "-c:a", "aac",
         "-b:a", "192k",
         output_path
@@ -259,7 +264,7 @@ async def upload_and_clip(
         raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[-300:]}")
 
     def cleanup():
-        for f in [input_video_path, audio_wav_path, output_path]:
+        for f in [input_video_path, slice_video_path, audio_wav_path, output_path]:
             if os.path.exists(f):
                 try:
                     os.remove(f)
