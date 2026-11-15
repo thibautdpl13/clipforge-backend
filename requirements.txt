@@ -4,3 +4,4 @@ python-multipart
 faster-whisper
 av
 google-auth
+requests
