@@ -1,15 +1,16 @@
 import os
 import re
 import random
+import sqlite3
 import urllib.request
 import subprocess
 from typing import List, Dict, Any
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.5")
+app = FastAPI(title="ClipForge AI Gated Engine", version="11.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,13 +22,73 @@ app.add_middleware(
 
 FONT_PATH = "/tmp/heavy_font.ttf"
 MODEL_SIZE = "tiny"
+DB_PATH = "/tmp/users.db"
 whisper_model = None
 
+# --- DATABASE SETUP ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            auth_provider TEXT,
+            tier TEXT DEFAULT 'demo',
+            clips_remaining INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_user_record(email: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT email, auth_provider, tier, clips_remaining FROM users WHERE email = ?", (email,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"email": row[0], "auth_provider": row[1], "tier": row[2], "clips_remaining": row[3]}
+    return None
+
+def create_or_get_user(email: str, auth_provider: str):
+    user = get_user_record(email)
+    if not user:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # New users start with 1 free demo clip
+        cursor.execute("""
+            INSERT INTO users (email, auth_provider, tier, clips_remaining)
+            VALUES (?, ?, 'demo', 1)
+        """, (email, auth_provider))
+        conn.commit()
+        conn.close()
+        return get_user_record(email)
+    return user
+
+def deduct_clip_credit(email: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    user = get_user_record(email)
+    if user and user["tier"] == "agency":
+        conn.close()
+        return True
+    
+    if user and user["clips_remaining"] > 0:
+        new_credits = user["clips_remaining"] - 1
+        new_tier = "demo_used" if user["tier"] == "demo" else user["tier"]
+        cursor.execute("UPDATE users SET clips_remaining = ?, tier = ? WHERE email = ?", (new_credits, new_tier, email))
+        conn.commit()
+        conn.close()
+        return True
+    conn.close()
+    return False
+
+# --- WHISPER & FONT SETUP ---
 def get_whisper_model():
     global whisper_model
     if whisper_model is None:
         try:
-            # cpu_threads=1 keeps RAM usage strictly flat and low
             whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=1)
         except Exception as e:
             print(f"Failed to load Whisper model: {e}")
@@ -50,6 +111,7 @@ def ensure_heavy_font():
 
 @app.on_event("startup")
 def startup_event():
+    init_db()
     ensure_heavy_font()
     get_whisper_model()
 
@@ -57,16 +119,45 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Stable Engine",
+        "service": "ClipForge Gated Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
 
+# --- AUTH ENDPOINTS ---
+@app.post("/auth/login")
+def login_user(payload: Dict[str, str]):
+    email = payload.get("email", "").strip().lower()
+    auth_provider = payload.get("auth_provider", "email").strip()
+    
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Invalid email address provided.")
+    
+    user = create_or_get_user(email, auth_provider)
+    return {"status": "success", "user": user}
+
+# --- GATED CLIPPING ENDPOINT ---
 @app.post("/upload-and-clip")
 async def upload_and_clip(
     file: UploadFile = File(...),
+    x_user_email: str = Header(None),
     background_tasks: BackgroundTasks = None
 ) -> FileResponse:
+    if not x_user_email:
+        raise HTTPException(status_code=401, detail="Authentication required. Please sign in.")
+    
+    email = x_user_email.strip().lower()
+    user = get_user_record(email)
+    
+    if not user:
+        raise HTTPException(status_code=401, detail="User account not found. Please sign up.")
+    
+    if user["clips_remaining"] <= 0 and user["tier"] != "agency":
+        raise HTTPException(
+            status_code=403, 
+            detail="You have used your free demo clip! Please upgrade to Starter or Pro to continue generating clips."
+        )
+
     input_video_path = f"/tmp/{file.filename}"
     slice_video_path = f"/tmp/slice_{os.getpid()}.mp4"
     audio_wav_path = f"/tmp/audio_{os.getpid()}.wav"
@@ -89,7 +180,6 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
-    # 1. Get full video duration
     duration = 35.0
     try:
         probe_cmd = [
@@ -103,12 +193,10 @@ async def upload_and_clip(
     except Exception:
         pass
 
-    # 2. Pick a random start time anywhere in the video for a 30s-45s clip snippet
     clip_duration = min(duration, 45.0)
     max_start = max(0.0, duration - clip_duration)
     start_time = random.uniform(0.0, max_start) if max_start > 0 else 0.0
 
-    # 3. Quickly slice the video snippet first using FFmpeg (zero RAM usage)
     try:
         slice_cmd = [
             "ffmpeg", "-y",
@@ -120,7 +208,6 @@ async def upload_and_clip(
         ]
         res = subprocess.run(slice_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if res.returncode != 0 or not os.path.exists(slice_video_path) or os.path.getsize(slice_video_path) == 0:
-            # Fallback if stream copy fails
             slice_cmd = [
                 "ffmpeg", "-y",
                 "-ss", str(start_time),
@@ -132,7 +219,6 @@ async def upload_and_clip(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Video slicing failed: {str(e)}")
 
-    # 4. Extract audio ONLY from this small slice (tiny file size, zero RAM pressure)
     try:
         extract_cmd = [
             "ffmpeg", "-y", "-i", slice_video_path,
@@ -142,7 +228,6 @@ async def upload_and_clip(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
-    # 5. Run Whisper on the lightweight slice audio (stays safely under 512MB RAM)
     raw_word_list = []
     model = get_whisper_model()
     
@@ -169,7 +254,6 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
-    # 1. Merge split number/comma tokens (e.g. "100" and ",000" -> "100,000")
     merged_list = []
     for w in raw_word_list:
         if merged_list and (w["text"].startswith(",") or w["text"] == ","):
@@ -178,7 +262,6 @@ async def upload_and_clip(
         else:
             merged_list.append(w)
 
-    # 2. Strip useless "A " before dollar amounts (e.g., "A $250,000" -> "$250,000")
     word_timed_list = []
     i = 0
     while i < len(merged_list):
@@ -199,7 +282,6 @@ async def upload_and_clip(
 
     font_file = ensure_heavy_font()
 
-    # Intelligent Word Grouping into Reader-Friendly Chunks (Max 3-4 words)
     chunked_subtitles = []
     current_chunk = []
     chunk_start = None
@@ -244,7 +326,6 @@ async def upload_and_clip(
 
     video_filter = ",".join(vf_filters)
 
-    # 6. Final render on the already-sliced video snippet
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-i", slice_video_path,
@@ -262,6 +343,8 @@ async def upload_and_clip(
     if ff_res.returncode != 0 or not os.path.exists(output_path):
         ff_err = ff_res.stderr.decode('utf-8', errors='ignore')
         raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[-300:]}")
+
+    deduct_clip_credit(email)
 
     def cleanup():
         for f in [input_video_path, slice_video_path, audio_wav_path, output_path]:
