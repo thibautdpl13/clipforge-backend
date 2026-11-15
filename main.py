@@ -1,7 +1,7 @@
 import os
 import re
 import random
-import sqlite3
+import psycopg2
 import urllib.request
 import subprocess
 from typing import List, Dict, Any
@@ -24,31 +24,41 @@ app.add_middleware(
 
 FONT_PATH = "/tmp/heavy_font.ttf"
 MODEL_SIZE = "tiny"
-DB_PATH = "/tmp/users.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 GOOGLE_CLIENT_ID = "925975701527-647ur1l151irhhiv4ifnunkq8i3s0bd9.apps.googleusercontent.com"
 whisper_model = None
 
-# --- DATABASE SETUP ---
+# --- DATABASE SETUP (NEON POSTGRESQL) ---
+def get_db_connection():
+    if DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL, sslmode='require')
+    else:
+        # Fallback for local testing if env var isn't set
+        import sqlite3
+        return sqlite3.connect("/tmp/users.db")
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            auth_provider TEXT,
-            tier TEXT DEFAULT 'demo',
+            email VARCHAR(255) PRIMARY KEY,
+            auth_provider VARCHAR(50),
+            tier VARCHAR(50) DEFAULT 'demo',
             clips_remaining INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
+    cursor.close()
     conn.close()
 
 def get_user_record(email: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT email, auth_provider, tier, clips_remaining FROM users WHERE email = ?", (email,))
+    cursor.execute("SELECT email, auth_provider, tier, clips_remaining FROM users WHERE email = %s", (email,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     if row:
         return {"email": row[0], "auth_provider": row[1], "tier": row[2], "clips_remaining": row[3]}
@@ -57,33 +67,38 @@ def get_user_record(email: str):
 def create_or_get_user(email: str, auth_provider: str):
     user = get_user_record(email)
     if not user:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         cursor = conn.cursor()
         # New users start with 1 free demo clip
         cursor.execute("""
             INSERT INTO users (email, auth_provider, tier, clips_remaining)
-            VALUES (?, ?, 'demo', 1)
+            VALUES (%s, %s, 'demo', 1)
+            ON CONFLICT (email) DO NOTHING
         """, (email, auth_provider))
         conn.commit()
+        cursor.close()
         conn.close()
         return get_user_record(email)
     return user
 
 def deduct_clip_credit(email: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     user = get_user_record(email)
     if user and user["tier"] == "agency":
+        cursor.close()
         conn.close()
         return True
     
     if user and user["clips_remaining"] > 0:
         new_credits = user["clips_remaining"] - 1
         new_tier = "demo_used" if user["tier"] == "demo" else user["tier"]
-        cursor.execute("UPDATE users SET clips_remaining = ?, tier = ? WHERE email = ?", (new_credits, new_tier, email))
+        cursor.execute("UPDATE users SET clips_remaining = %s, tier = %s WHERE email = %s", (new_credits, new_tier, email))
         conn.commit()
+        cursor.close()
         conn.close()
         return True
+    cursor.close()
     conn.close()
     return False
 
@@ -146,7 +161,6 @@ def google_auth(payload: Dict[str, str]):
         raise HTTPException(status_code=400, detail="Google token missing.")
     
     try:
-        # Verify the Google ID token securely using Google's official library
         idinfo = id_token.verify_oauth2_token(
             token, 
             google_requests.Request(), 
@@ -182,7 +196,7 @@ async def upload_and_clip(
     if user["clips_remaining"] <= 0 and user["tier"] != "agency":
         raise HTTPException(
             status_code=403, 
-            detail="You have used your free demo clip! Please upgrade to Starter or Pro to continue generating clips."
+            detail="You have used your free demo clip! Please upgrade to continue generating clips."
         )
 
     input_video_path = f"/tmp/{file.filename}"
