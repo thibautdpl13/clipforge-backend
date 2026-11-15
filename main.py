@@ -9,8 +9,10 @@ from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Background
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
-app = FastAPI(title="ClipForge AI Gated Engine", version="11.1.0")
+app = FastAPI(title="ClipForge AI Gated Engine", version="11.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,6 +25,7 @@ app.add_middleware(
 FONT_PATH = "/tmp/heavy_font.ttf"
 MODEL_SIZE = "tiny"
 DB_PATH = "/tmp/users.db"
+GOOGLE_CLIENT_ID = "925975701527-647ur1l151irhhiv4ifnunkq8i3s0bd9.apps.googleusercontent.com"
 whisper_model = None
 
 # --- DATABASE SETUP ---
@@ -135,6 +138,30 @@ def login_user(payload: Dict[str, str]):
     
     user = create_or_get_user(email, auth_provider)
     return {"status": "success", "user": user}
+
+@app.post("/api/auth/google")
+def google_auth(payload: Dict[str, str]):
+    token = payload.get("token")
+    if not token:
+        raise HTTPException(status_code=400, detail="Google token missing.")
+    
+    try:
+        # Verify the Google ID token securely using Google's official library
+        idinfo = id_token.verify_oauth2_token(
+            token, 
+            google_requests.Request(), 
+            GOOGLE_CLIENT_ID
+        )
+        
+        email = idinfo.get("email", "").strip().lower()
+        if not email:
+            raise HTTPException(status_code=400, detail="Google token did not contain an email.")
+        
+        user = create_or_get_user(email, "google")
+        return {"status": "success", "user": user}
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid Google token: {str(e)}")
 
 # --- GATED CLIPPING ENDPOINT ---
 @app.post("/upload-and-clip")
