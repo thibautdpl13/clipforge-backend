@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Highlight Engine", version="10.9.7")
+app = FastAPI(title="ClipForge AI Highlight Engine", version="10.9.8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -222,15 +222,15 @@ async def upload_and_clip(
     for sub in chunked_subtitles:
         safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
         
-        # Safe fixed-width center highlight box behind subtitles at y=1300
+        # Using drawtext first to calculate text positioning, then placing a box behind it using text dimensions
+        # In FFmpeg filters applied sequentially, we draw the box using standard centering coordinates matching the text
         box_filter = (
             f"drawbox="
-            f"x=(w-700)/2:y=1285:w=700:h=85:"
-            f"color=black@0.7:t=fill:"
+            f"x=(w-text_w)/2-30:y=1285:w=text_w+60:h=80:"
+            f"color=black@0.75:t=fill:"
             f"enable='between(t,{sub['start']},{sub['end']})'"
         )
         
-        # White bold text centered over the highlight box
         text_filter = (
             f"drawtext=text='{safe_text}':"
             f"fontfile={font_file}:"
