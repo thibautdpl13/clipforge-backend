@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="ClipForge AI Highlight Engine", version="10.9.9")
+app = FastAPI(title="ClipForge AI Stable Engine", version="10.9.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +27,7 @@ def get_whisper_model():
     global whisper_model
     if whisper_model is None:
         try:
+            # cpu_threads=1 keeps RAM usage strictly flat and low
             whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=1)
         except Exception as e:
             print(f"Failed to load Whisper model: {e}")
@@ -56,7 +57,7 @@ def startup_event():
 def health_check() -> Dict[str, Any]:
     return {
         "status": "online",
-        "service": "ClipForge Highlight Engine",
+        "service": "ClipForge Stable Engine",
         "model": MODEL_SIZE,
         "font": ensure_heavy_font()
     }
@@ -88,6 +89,7 @@ async def upload_and_clip(
     if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
+    # 1. Get full video duration
     duration = 35.0
     try:
         probe_cmd = [
@@ -101,10 +103,12 @@ async def upload_and_clip(
     except Exception:
         pass
 
+    # 2. Pick a random start time anywhere in the video for a 30s-45s clip snippet
     clip_duration = min(duration, 45.0)
     max_start = max(0.0, duration - clip_duration)
     start_time = random.uniform(0.0, max_start) if max_start > 0 else 0.0
 
+    # 3. Quickly slice the video snippet first using FFmpeg (zero RAM usage)
     try:
         slice_cmd = [
             "ffmpeg", "-y",
@@ -116,6 +120,7 @@ async def upload_and_clip(
         ]
         res = subprocess.run(slice_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if res.returncode != 0 or not os.path.exists(slice_video_path) or os.path.getsize(slice_video_path) == 0:
+            # Fallback if stream copy fails
             slice_cmd = [
                 "ffmpeg", "-y",
                 "-ss", str(start_time),
@@ -127,6 +132,7 @@ async def upload_and_clip(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Video slicing failed: {str(e)}")
 
+    # 4. Extract audio ONLY from this small slice (tiny file size, zero RAM pressure)
     try:
         extract_cmd = [
             "ffmpeg", "-y", "-i", slice_video_path,
@@ -136,6 +142,7 @@ async def upload_and_clip(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
+    # 5. Run Whisper on the lightweight slice audio (stays safely under 512MB RAM)
     raw_word_list = []
     model = get_whisper_model()
     
@@ -162,6 +169,7 @@ async def upload_and_clip(
         except Exception as e:
             print(f"Whisper transcription error: {e}")
 
+    # 1. Merge split number/comma tokens (e.g. "100" and ",000" -> "100,000")
     merged_list = []
     for w in raw_word_list:
         if merged_list and (w["text"].startswith(",") or w["text"] == ","):
@@ -170,6 +178,7 @@ async def upload_and_clip(
         else:
             merged_list.append(w)
 
+    # 2. Strip useless "A " before dollar amounts (e.g., "A $250,000" -> "$250,000")
     word_timed_list = []
     i = 0
     while i < len(merged_list):
@@ -190,6 +199,7 @@ async def upload_and_clip(
 
     font_file = ensure_heavy_font()
 
+    # Intelligent Word Grouping into Reader-Friendly Chunks (Max 3-4 words)
     chunked_subtitles = []
     current_chunk = []
     chunk_start = None
@@ -221,28 +231,20 @@ async def upload_and_clip(
 
     for sub in chunked_subtitles:
         safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', '')
-        
-        # Safe centered background highlight box
-        box_filter = (
-            f"drawbox="
-            f"x=(w-800)/2:y=1280:w=800:h=90:"
-            f"color=black@0.7:t=fill:"
-            f"enable='between(t,{sub['start']},{sub['end']})'"
-        )
-        
-        # Clean Montserrat-Black text centered over the box
-        text_filter = (
+        draw_filter = (
             f"drawtext=text='{safe_text}':"
             f"fontfile={font_file}:"
             f"fontsize=52:fontcolor=white:"
+            f"borderw=5:bordercolor=black:"
+            f"shadowx=2:shadowy=2:shadowcolor=black@1.0:"
             f"x=(w-text_w)/2:y=1300:"
             f"enable='between(t,{sub['start']},{sub['end']})'"
         )
-        
-        vf_filters.extend([box_filter, text_filter])
+        vf_filters.append(draw_filter)
 
     video_filter = ",".join(vf_filters)
 
+    # 6. Final render on the already-sliced video snippet
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-i", slice_video_path,
