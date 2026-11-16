@@ -2,35 +2,42 @@ import os
 import shutil
 import subprocess
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
-from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends, status, BackgroundTasks
+from typing import Optional, Dict, Any, List
+from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends, status, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 import requests
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # ==========================================
 # 1. SECURITY & CONFIGURATION CONSTANTS
 # ==========================================
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clipforge_super_secure_secret_key_change_in_prod_998877")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clipforge_super_secure_secret_key_production_random_998877")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days valid access token
 MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024     # Strict 250MB upload cap
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# Initialize Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ClipForge AI Production Backend",
-    description="Automated video clipping, JWT authentication, and compliance backend engine.",
-    version="2.2.0"
+    description="Automated video clipping, JWT authentication, rate limiting, and compliance backend engine.",
+    version="2.5.0"
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ==========================================
-# 2. CORS MIDDLEWARE CONFIGURATION
+# 2. CORS & SECURITY HEADERS MIDDLEWARE
 # ==========================================
 origins = [
     "https://thibautdpl13.github.io",
@@ -47,13 +54,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Adds robust security headers (HSTS, X-Content-Type-Options, CSP, X-Frame-Options) to all responses."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Content-Security-Policy"] = "default-src 'self' https://cdn.tailwindcss.com https://accounts.google.com https://*.googleapis.com https://*.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' blob: data:; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://accounts.google.com https://*.googleapis.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;"
+    return response
+
 # ==========================================
 # 3. DATABASE CONNECTION & MIGRATION UTILS
 # ==========================================
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_db_connection() -> psycopg2.extensions.connection:
-    """Establishes and returns a live connection to the PostgreSQL database."""
+    """Establishes and returns a live connection to the PostgreSQL database with RealDictCursor."""
     if not DATABASE_URL:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -70,7 +88,7 @@ def get_db_connection() -> psycopg2.extensions.connection:
 
 @app.on_event("startup")
 def startup_db_initialization() -> None:
-    """Ensures required PostgreSQL tables and columns exist upon application startup."""
+    """Ensures required PostgreSQL tables and security columns exist upon application startup."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -87,7 +105,7 @@ def startup_db_initialization() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Safe column additions in case table already existed from v1
+        # Safe column additions in case table already existed from earlier iterations
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS age_verified BOOLEAN DEFAULT FALSE;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_scheduled_at TIMESTAMP DEFAULT NULL;")
@@ -220,12 +238,13 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, A
 @app.get("/", tags=["Health"])
 def health_check():
     """Health check endpoint for Render deployment monitoring."""
-    return {"status": "online", "service": "ClipForge AI Backend", "version": "2.2.0"}
+    return {"status": "online", "service": "ClipForge AI Backend", "version": "2.5.0"}
 
 
 @app.post("/auth/register-login", response_model=TokenResponseSchema, tags=["Authentication"])
-def register_or_login_email_endpoint(data: EmailRegisterLoginSchema):
-    """Handles secure user registration and login via email and password."""
+@limiter.limit("10/minute")
+def register_or_login_email_endpoint(request: Request, data: EmailRegisterLoginSchema):
+    """Handles secure user registration and login via email and password with rate limiting."""
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -234,14 +253,12 @@ def register_or_login_email_endpoint(data: EmailRegisterLoginSchema):
         user = cur.fetchone()
 
         if user:
-            # Verify password first so unauthorized people cannot probe deletion dates
             if not user["password_hash"] or not verify_password(data.password, user["password_hash"]):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Incorrect password or account was originally registered via Google Sign-In."
                 )
 
-            # Handle pending 30-day scheduled deletion
             if user["deletion_scheduled_at"]:
                 if datetime.utcnow() < user["deletion_scheduled_at"]:
                     if not data.cancel_deletion:
@@ -256,19 +273,16 @@ def register_or_login_email_endpoint(data: EmailRegisterLoginSchema):
                             }
                         )
                     else:
-                        # User chose to cancel deletion and restore their account
                         cur.execute("UPDATE users SET deletion_scheduled_at = NULL WHERE email = %s;", (data.email,))
                         conn.commit()
                         cur.execute("SELECT * FROM users WHERE email = %s;", (data.email,))
                         user = cur.fetchone()
                 else:
-                    # 30 days elapsed: permanently delete old record, allow fresh registration
                     cur.execute("DELETE FROM users WHERE email = %s;", (data.email,))
                     conn.commit()
                     user = None
 
         if not user:
-            # New account registration workflow
             if not data.age_verified:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -306,8 +320,9 @@ def register_or_login_email_endpoint(data: EmailRegisterLoginSchema):
 
 
 @app.post("/api/auth/google", response_model=TokenResponseSchema, tags=["Authentication"])
-def google_auth_endpoint(data: GoogleAuthSchema):
-    """Verifies Google ID tokens and provisions or authenticates users without requiring a password."""
+@limiter.limit("15/minute")
+def google_auth_endpoint(request: Request, data: GoogleAuthSchema):
+    """Verifies Google ID tokens and provisions or authenticates users securely."""
     try:
         google_response = requests.get(f"https://oauth2.googleapis.com/tokeninfo?id_token={data.token}", timeout=10)
         google_data = google_response.json()
@@ -391,7 +406,8 @@ def google_auth_endpoint(data: GoogleAuthSchema):
 # 7. ACCOUNT LIFECYCLE MANAGEMENT ENDPOINTS
 # ==========================================
 @app.post("/api/account/schedule-deletion", tags=["Account Lifecycle"])
-def schedule_account_deletion_endpoint(current_user: Dict[str, Any] = Depends(get_current_user)):
+@limiter.limit("5/minute")
+def schedule_account_deletion_endpoint(request: Request, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Schedules account deletion exactly 30 days from now down to the minute."""
     deletion_time = datetime.utcnow() + timedelta(days=30)
     formatted_dt = deletion_time.strftime("%B %d, %Y at %H:%M UTC")
@@ -420,7 +436,9 @@ def schedule_account_deletion_endpoint(current_user: Dict[str, Any] = Depends(ge
 # 8. CORE VIDEO CLIPPING PIPELINE ENDPOINT
 # ==========================================
 @app.post("/upload-and-clip", tags=["Video Processing"])
+@limiter.limit("10/minute")
 async def upload_and_clip_endpoint(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -433,7 +451,6 @@ async def upload_and_clip_endpoint(
             detail="Uploaded file exceeds the maximum permitted size limit of 250MB."
         )
 
-    # Credit consumption validation
     if current_user["clips_remaining"] <= 0 and current_user["tier"] != "agency":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -448,7 +465,6 @@ async def upload_and_clip_endpoint(
         buffer_file.write(file_contents)
 
     try:
-        # High-performance FFmpeg rendering command for short-form vertical conversion
         ffmpeg_command = [
             "ffmpeg", "-y", "-i", input_filepath,
             "-ss", "00:00:00", "-to", "00:00:30",
@@ -470,7 +486,6 @@ async def upload_and_clip_endpoint(
                 detail=f"FFmpeg rendering execution failed: {process_result.stderr[-200:]}"
             )
 
-        # Deduct credit and update tier usage in database atomically
         conn = get_db_connection()
         cur = conn.cursor()
         try:
@@ -486,7 +501,6 @@ async def upload_and_clip_endpoint(
             cur.close()
             conn.close()
 
-        # Schedule automatic cleanup of temporary server files after sending response
         background_tasks.add_task(cleanup_temp_files, input_filepath, output_filepath)
 
         return FileResponse(
