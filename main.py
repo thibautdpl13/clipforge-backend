@@ -1,8 +1,10 @@
 import os
-import shutil
+import time
+import logging
+import hashlib
 import subprocess
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, Set
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends, status, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -17,12 +19,28 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 # ==========================================
-# 1. SECURITY & CONFIGURATION CONSTANTS
+# 1. LOGGING & SECURITY CONSTANTS
 # ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("clipforge.backend")
+
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clipforge_super_secure_secret_key_production_random_998877")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days valid access token
-MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024     # Strict 250MB upload cap
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7       # 7 days valid access token
+MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024          # Strict 250MB upload cap
+ALLOWED_VIDEO_MIME_TYPES: Set[str] = {
+    "video/mp4",
+    "video/quicktime",
+    "video/webm",
+    "video/x-msvideo",
+    "video/x-matroska"
+}
+
+# In-memory active processing lock to prevent duplicate simultaneous submissions per user
+ACTIVE_USER_JOBS: Set[str] = set()
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -31,7 +49,9 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ClipForge AI Production Backend",
     description="Automated video clipping, JWT authentication, rate limiting, and compliance backend engine.",
-    version="2.5.0"
+    version="3.0.0",
+    docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
+    redoc_url=None
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -50,45 +70,76 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 @app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    """Adds robust security headers (HSTS, X-Content-Type-Options, CSP, X-Frame-Options) to all responses."""
-    response = await call_next(request)
+async def add_security_and_timing_headers(request: Request, call_next):
+    """Adds security headers, measures request latency, and logs suspicious 4xx/5xx patterns."""
+    start_time = time.time()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        logger.error(f"Unhandled exception on {request.method} {request.url.path}: {str(exc)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal server error. The incident has been logged."}
+        )
+
+    process_time_ms = round((time.time() - start_time) * 1000, 2)
+    response.headers["X-Process-Time-Ms"] = str(process_time_ms)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["Content-Security-Policy"] = "default-src 'self' https://cdn.tailwindcss.com https://accounts.google.com https://*.googleapis.com https://*.gstatic.com; img-src 'self' data: blob: https:; media-src 'self' blob: data:; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://accounts.google.com https://*.googleapis.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self' https://cdn.tailwindcss.com https://accounts.google.com https://*.googleapis.com https://*.gstatic.com; "
+        "img-src 'self' data: blob: https:; "
+        "media-src 'self' blob: data:; "
+        "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://accounts.google.com https://*.googleapis.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com;"
+    )
+
+    if response.status_code >= 400:
+        client_ip = request.client.host if request.client else "unknown"
+        logger.warning(f"HTTP {response.status_code} | {request.method} {request.url.path} | IP: {client_ip} | {process_time_ms}ms")
+
     return response
 
+
 # ==========================================
-# 3. DATABASE CONNECTION & MIGRATION UTILS
+# 3. DATABASE CONNECTION & INDEX INITIALIZATION
 # ==========================================
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_db_connection() -> psycopg2.extensions.connection:
-    """Establishes and returns a live connection to the PostgreSQL database with RealDictCursor."""
+    """Establishes and returns a live connection to PostgreSQL with connection timeout."""
     if not DATABASE_URL:
+        logger.critical("DATABASE_URL environment variable is missing.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Critical: DATABASE_URL environment variable is not configured."
+            detail="Database configuration error."
         )
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        conn = psycopg2.connect(
+            DATABASE_URL,
+            cursor_factory=RealDictCursor,
+            connect_timeout=10
+        )
         return conn
     except Exception as e:
+        logger.error(f"Database connection failure: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database connection error: {str(e)}"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service temporarily unavailable. Please try again shortly."
         )
 
 @app.on_event("startup")
 def startup_db_initialization() -> None:
-    """Ensures required PostgreSQL tables and security columns exist upon application startup."""
+    """Creates tables, applies schema migrations, and creates performance indexes on startup."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -98,21 +149,27 @@ def startup_db_initialization() -> None:
                 email VARCHAR(255) UNIQUE NOT NULL,
                 password_hash VARCHAR(255),
                 auth_provider VARCHAR(50) DEFAULT 'email',
-                tier VARCHAR(50) DEFAULT 'demo',
+                tier VARCHAR(50) DEFAULT 'free',
                 clips_remaining INT DEFAULT 1,
                 age_verified BOOLEAN DEFAULT FALSE,
                 deletion_scheduled_at TIMESTAMP DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Safe column additions in case table already existed from earlier iterations
+        # Safe column additions for backward compatibility
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS age_verified BOOLEAN DEFAULT FALSE;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_scheduled_at TIMESTAMP DEFAULT NULL;")
+
+        # Database performance indexes
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_deletion_scheduled ON users (deletion_scheduled_at) WHERE deletion_scheduled_at IS NOT NULL;")
+
         conn.commit()
+        logger.info("Database schema and indexes verified successfully.")
     except Exception as e:
         conn.rollback()
-        print(f"Startup DB Migration Warning: {e}")
+        logger.error(f"Startup DB Migration Error: {e}")
     finally:
         cur.close()
         conn.close()
@@ -123,12 +180,12 @@ def startup_db_initialization() -> None:
 # ==========================================
 class EmailRegisterLoginSchema(BaseModel):
     email: EmailStr = Field(..., description="User email address")
-    password: str = Field(..., min_length=8, description="Secure account password")
+    password: str = Field(..., min_length=8, max_length=128, description="Secure account password")
     age_verified: bool = Field(default=False, description="Confirmation that user meets minimum age requirement")
     cancel_deletion: bool = Field(default=False, description="Explicit confirmation to cancel pending 30-day deletion")
 
 class GoogleAuthSchema(BaseModel):
-    token: str = Field(..., description="Google OAuth credential ID token")
+    token: str = Field(..., min_length=10, description="Google OAuth credential ID token")
     age_verified: bool = Field(default=False, description="Confirmation of minimum age requirement")
     cancel_deletion: bool = Field(default=False, description="Explicit confirmation to cancel pending 30-day deletion")
 
@@ -156,8 +213,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def cleanup_temp_files(*filepaths: str) -> None:
     """Background task helper to remove temporary video files after streaming response."""
@@ -166,10 +222,10 @@ def cleanup_temp_files(*filepaths: str) -> None:
             try:
                 os.remove(path)
             except Exception as e:
-                print(f"Cleanup warning for {path}: {e}")
+                logger.warning(f"Temp file cleanup warning for {path}: {e}")
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
-    """Dependency validator that decodes JWT tokens and checks account deletion status."""
+    """Dependency validator that decodes JWT tokens and enforces account deletion status."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -188,13 +244,16 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, A
     except JWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate authentication credentials or token has expired."
+            detail="Session expired or invalid credentials. Please sign in again."
         )
 
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT * FROM users WHERE email = %s;", (email,))
+        cur.execute(
+            "SELECT id, email, auth_provider, tier, clips_remaining, age_verified, deletion_scheduled_at FROM users WHERE email = %s;",
+            (email,)
+        )
         user = cur.fetchone()
     finally:
         cur.close()
@@ -203,10 +262,9 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, A
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User account associated with token no longer exists."
+            detail="User account no longer exists."
         )
 
-    # Check 30-day scheduled account deletion status
     if user["deletion_scheduled_at"]:
         if datetime.utcnow() >= user["deletion_scheduled_at"]:
             purge_conn = get_db_connection()
@@ -226,30 +284,48 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, A
             formatted_dt = user["deletion_scheduled_at"].strftime("%Y-%m-%d at %H:%M UTC")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Account deletion is scheduled for {formatted_dt}. Please log in again and confirm cancellation to restore access."
+                detail=f"Account deletion is scheduled for {formatted_dt}. Sign in again and confirm cancellation to restore access."
             )
 
     return user
 
 
 # ==========================================
-# 6. API ROUTE ENDPOINTS: AUTHENTICATION
+# 6. API ROUTE ENDPOINTS: HEALTH & AUTH
 # ==========================================
 @app.get("/", tags=["Health"])
+@app.get("/health", tags=["Health"])
 def health_check():
-    """Health check endpoint for Render deployment monitoring."""
-    return {"status": "online", "service": "ClipForge AI Backend", "version": "2.5.0"}
+    """Uptime monitoring endpoint verifying API and database responsiveness."""
+    db_status = "connected"
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1;")
+        cur.close()
+        conn.close()
+    except Exception:
+        db_status = "degraded"
+
+    return {
+        "status": "online",
+        "service": "ClipForge AI Backend",
+        "version": "3.0.0",
+        "database": db_status,
+        "timestamp_utc": datetime.utcnow().isoformat()
+    }
 
 
 @app.post("/auth/register-login", response_model=TokenResponseSchema, tags=["Authentication"])
 @limiter.limit("10/minute")
 def register_or_login_email_endpoint(request: Request, data: EmailRegisterLoginSchema):
     """Handles secure user registration and login via email and password with rate limiting."""
+    normalized_email = data.email.strip().lower()
     conn = get_db_connection()
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT * FROM users WHERE email = %s;", (data.email,))
+        cur.execute("SELECT * FROM users WHERE email = %s;", (normalized_email,))
         user = cur.fetchone()
 
         if user:
@@ -269,16 +345,16 @@ def register_or_login_email_endpoint(request: Request, data: EmailRegisterLoginS
                                 "code": "DELETION_PENDING",
                                 "scheduled_at": user["deletion_scheduled_at"].isoformat(),
                                 "formatted_date": formatted_dt,
-                                "message": f"Your account deletion is scheduled for {formatted_dt}. Would you like to cancel the deletion and restore your account with all your data?"
+                                "message": f"Your account deletion is scheduled for {formatted_dt}. Cancel deletion and restore your account?"
                             }
                         )
                     else:
-                        cur.execute("UPDATE users SET deletion_scheduled_at = NULL WHERE email = %s;", (data.email,))
+                        cur.execute("UPDATE users SET deletion_scheduled_at = NULL WHERE email = %s;", (normalized_email,))
                         conn.commit()
-                        cur.execute("SELECT * FROM users WHERE email = %s;", (data.email,))
+                        cur.execute("SELECT * FROM users WHERE email = %s;", (normalized_email,))
                         user = cur.fetchone()
                 else:
-                    cur.execute("DELETE FROM users WHERE email = %s;", (data.email,))
+                    cur.execute("DELETE FROM users WHERE email = %s;", (normalized_email,))
                     conn.commit()
                     user = None
 
@@ -292,14 +368,14 @@ def register_or_login_email_endpoint(request: Request, data: EmailRegisterLoginS
             hashed_pw = get_password_hash(data.password)
             cur.execute(
                 """INSERT INTO users (email, password_hash, auth_provider, tier, clips_remaining, age_verified)
-                   VALUES (%s, %s, 'email', 'demo', 1, %s) RETURNING *;""",
-                (data.email, hashed_pw, data.age_verified)
+                   VALUES (%s, %s, 'email', 'free', 1, %s) RETURNING *;""",
+                (normalized_email, hashed_pw, data.age_verified)
             )
             user = cur.fetchone()
             conn.commit()
+            logger.info(f"New email account provisioned: {normalized_email}")
 
         access_token = create_access_token(data={"sub": user["email"]})
-
         user_payload = {
             "email": user["email"],
             "tier": user["tier"],
@@ -322,19 +398,27 @@ def register_or_login_email_endpoint(request: Request, data: EmailRegisterLoginS
 @app.post("/api/auth/google", response_model=TokenResponseSchema, tags=["Authentication"])
 @limiter.limit("15/minute")
 def google_auth_endpoint(request: Request, data: GoogleAuthSchema):
-    """Verifies Google ID tokens and provisions or authenticates users securely."""
+    """Verifies Google ID tokens with timeout protection and provisions or authenticates users."""
     try:
-        google_response = requests.get(f"https://oauth2.googleapis.com/tokeninfo?id_token={data.token}", timeout=10)
+        google_response = requests.get(
+            f"https://oauth2.googleapis.com/tokeninfo?id_token={data.token}",
+            timeout=8
+        )
         google_data = google_response.json()
         if "email" not in google_data:
             raise HTTPException(status_code=400, detail="Google token verification failed.")
-        email = google_data["email"]
+        email = google_data["email"].strip().lower()
+    except requests.Timeout:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Google authentication service timed out. Please retry."
+        )
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unable to validate Google authentication token with provider."
+            detail="Unable to validate Google authentication token."
         )
 
     conn = get_db_connection()
@@ -354,7 +438,7 @@ def google_auth_endpoint(request: Request, data: GoogleAuthSchema):
                             "code": "DELETION_PENDING",
                             "scheduled_at": user["deletion_scheduled_at"].isoformat(),
                             "formatted_date": formatted_dt,
-                            "message": f"Your account deletion is scheduled for {formatted_dt}. Would you like to cancel the deletion and restore your account with all your data?"
+                            "message": f"Your account deletion is scheduled for {formatted_dt}. Cancel deletion and restore your account?"
                         }
                     )
                 else:
@@ -376,11 +460,12 @@ def google_auth_endpoint(request: Request, data: GoogleAuthSchema):
 
             cur.execute(
                 """INSERT INTO users (email, password_hash, auth_provider, tier, clips_remaining, age_verified)
-                   VALUES (%s, NULL, 'google', 'demo', 1, %s) RETURNING *;""",
+                   VALUES (%s, NULL, 'google', 'free', 1, %s) RETURNING *;""",
                 (email, data.age_verified)
             )
             user = cur.fetchone()
             conn.commit()
+            logger.info(f"New Google OAuth account provisioned: {email}")
 
         access_token = create_access_token(data={"sub": user["email"]})
         user_payload = {
@@ -408,7 +493,7 @@ def google_auth_endpoint(request: Request, data: GoogleAuthSchema):
 @app.post("/api/account/schedule-deletion", tags=["Account Lifecycle"])
 @limiter.limit("5/minute")
 def schedule_account_deletion_endpoint(request: Request, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Schedules account deletion exactly 30 days from now down to the minute."""
+    """Schedules account deletion 30 days from now."""
     deletion_time = datetime.utcnow() + timedelta(days=30)
     formatted_dt = deletion_time.strftime("%B %d, %Y at %H:%M UTC")
 
@@ -420,6 +505,7 @@ def schedule_account_deletion_endpoint(request: Request, current_user: Dict[str,
             (deletion_time, current_user["email"])
         )
         conn.commit()
+        logger.info(f"Account scheduled for deletion: {current_user['email']} at {formatted_dt}")
     finally:
         cur.close()
         conn.close()
@@ -428,7 +514,7 @@ def schedule_account_deletion_endpoint(request: Request, current_user: Dict[str,
         "status": "scheduled",
         "deletion_scheduled_at": deletion_time.isoformat(),
         "formatted_date": formatted_dt,
-        "message": f"Account deletion is scheduled for {formatted_dt} (30 days from now). If you log back in before then and choose to cancel deletion, your account and data will be restored."
+        "message": f"Account deletion is scheduled for {formatted_dt}."
     }
 
 
@@ -436,15 +522,37 @@ def schedule_account_deletion_endpoint(request: Request, current_user: Dict[str,
 # 8. CORE VIDEO CLIPPING PIPELINE ENDPOINT
 # ==========================================
 @app.post("/upload-and-clip", tags=["Video Processing"])
-@limiter.limit("10/minute")
+@limiter.limit("6/minute")
 async def upload_and_clip_endpoint(
     request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Secure video clipping endpoint with file size limits, credit verification, and FFmpeg processing."""
+    """Secure video clipping endpoint with MIME validation, duplicate job lock, size cap, and FFmpeg compression."""
+    user_email = current_user["email"]
+
+    # Prevent duplicate simultaneous requests from the same account
+    if user_email in ACTIVE_USER_JOBS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="A video is already processing on your account. Please wait for it to finish."
+        )
+
+    # Validate MIME type
+    if file.content_type not in ALLOWED_VIDEO_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type '{file.content_type}'. Allowed formats: MP4, MOV, WebM."
+        )
+
     file_contents = await file.read()
+    if len(file_contents) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty."
+        )
+
     if len(file_contents) > MAX_FILE_SIZE_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -457,6 +565,7 @@ async def upload_and_clip_endpoint(
             detail="No remaining clip credits available. Please upgrade your subscription tier."
         )
 
+    ACTIVE_USER_JOBS.add(user_email)
     job_identifier = os.urandom(6).hex()
     input_filepath = f"input_{job_identifier}.mp4"
     output_filepath = f"output_{job_identifier}.mp4"
@@ -465,36 +574,40 @@ async def upload_and_clip_endpoint(
         buffer_file.write(file_contents)
 
     try:
+        # Optimized FFmpeg vertical crop and H.264 web compression
         ffmpeg_command = [
             "ffmpeg", "-y", "-i", input_filepath,
             "-ss", "00:00:00", "-to", "00:00:30",
             "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", output_filepath
+            "-c:v", "libx264", "-preset", "fast", "-crf", "24",
+            "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "128k", output_filepath
         ]
 
         process_result = subprocess.run(
             ffmpeg_command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            timeout=120
         )
 
         if process_result.returncode != 0:
+            logger.error(f"FFmpeg error for {user_email}: {process_result.stderr[-300:]}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"FFmpeg rendering execution failed: {process_result.stderr[-200:]}"
+                detail="Video rendering failed due to an invalid stream or codec."
             )
 
         conn = get_db_connection()
         cur = conn.cursor()
         try:
             updated_credits = max(0, current_user["clips_remaining"] - 1) if current_user["tier"] != "agency" else current_user["clips_remaining"]
-            updated_tier = "demo_used" if current_user["tier"] == "demo" else current_user["tier"]
+            updated_tier = "free_used" if current_user["tier"] in ("free", "demo") else current_user["tier"]
 
             cur.execute(
                 "UPDATE users SET clips_remaining = %s, tier = %s WHERE email = %s;",
-                (updated_credits, updated_tier, current_user["email"])
+                (updated_credits, updated_tier, user_email)
             )
             conn.commit()
         finally:
@@ -509,11 +622,20 @@ async def upload_and_clip_endpoint(
             filename="clipforge_vertical_highlight.mp4"
         )
 
+    except subprocess.TimeoutExpired:
+        cleanup_temp_files(input_filepath, output_filepath)
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Video processing timed out. Try uploading a shorter clip."
+        )
     except Exception as err:
         cleanup_temp_files(input_filepath, output_filepath)
         if isinstance(err, HTTPException):
             raise err
+        logger.error(f"Unexpected error clipping video for {user_email}: {str(err)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An unexpected error occurred during clip generation: {str(err)}"
+            detail="An unexpected error occurred during clip generation."
         )
+    finally:
+        ACTIVE_USER_JOBS.discard(user_email)
