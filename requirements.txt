@@ -1,8 +1,8 @@
-fastapi
-uvicorn
-python-multipart
-faster-whisper
-av
-google-auth
-requests
-psycopg2-binary
+fastapi==0.110.0
+uvicorn==0.28.0
+psycopg2-binary==2.9.9
+python-multipart==0.0.9
+pydantic[email]==2.6.4
+requests==2.31.0
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
