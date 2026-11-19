@@ -8,4 +8,4 @@ python-jose[cryptography]
 requests
 slowapi
 pydantic[email]
-SpeechRecognition
+faster-whisper

@@ -6,8 +6,9 @@ import base64
 import random
 import logging
 import subprocess
+import urllib.request
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Set, List, Tuple
+from typing import Optional, Dict, Any, Set, List
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends, status, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -20,6 +21,7 @@ import requests
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from faster_whisper import WhisperModel
 
 # ==========================================
 # 1. LOGGING & SECURITY CONSTANTS
@@ -44,14 +46,20 @@ ALLOWED_VIDEO_MIME_TYPES: Set[str] = {
     "video/x-matroska"
 }
 
+FONT_PATH = "/tmp/heavy_font.ttf"
+MODEL_SIZE = "tiny"
+whisper_model: Optional[WhisperModel] = None
+
+# In-memory active processing lock to prevent duplicate simultaneous submissions per user
 ACTIVE_USER_JOBS: Set[str] = set()
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ClipForge AI Production Backend",
     description="Automated video clipping, JWT authentication, rate limiting, and compliance backend engine.",
-    version="3.7.0",
+    version="10.9.5",
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None
 )
@@ -112,7 +120,7 @@ async def add_security_and_timing_headers(request: Request, call_next):
 
 
 # ==========================================
-# 3. DATABASE CONNECTION & INDEX INITIALIZATION
+# 3. DATABASE CONNECTION & STARTUP INIT
 # ==========================================
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -137,8 +145,36 @@ def get_db_connection() -> psycopg2.extensions.connection:
             detail="Database service temporarily unavailable. Please try again shortly."
         )
 
+def get_whisper_model() -> Optional[WhisperModel]:
+    global whisper_model
+    if whisper_model is None:
+        try:
+            # cpu_threads=1 keeps RAM usage strictly flat and low
+            whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=1)
+        except Exception as e:
+            logger.error(f"Failed to load Whisper model: {e}")
+    return whisper_model
+
+def ensure_heavy_font() -> str:
+    if not os.path.exists(FONT_PATH):
+        try:
+            font_url = "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Black.ttf"
+            urllib.request.urlretrieve(font_url, FONT_PATH)
+        except Exception:
+            try:
+                fallback_url = "https://github.com/google/fonts/raw/main/ofl/robotoblack/Roboto-Black.ttf"
+                urllib.request.urlretrieve(fallback_url, FONT_PATH)
+            except Exception:
+                pass
+    if not os.path.exists(FONT_PATH):
+        return "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    return FONT_PATH
+
 @app.on_event("startup")
-def startup_db_initialization() -> None:
+def startup_db_and_engine_initialization() -> None:
+    ensure_heavy_font()
+    get_whisper_model()
+
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -175,7 +211,7 @@ def startup_db_initialization() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_renders_user_created ON renders (user_id, created_at DESC);")
 
         conn.commit()
-        logger.info("Database schema and indexes verified successfully.")
+        logger.info("Database schema, indexes, font, and Whisper model initialized successfully.")
     except Exception as e:
         conn.rollback()
         logger.error(f"Startup DB Migration Error: {e}")
@@ -205,7 +241,7 @@ class TokenResponseSchema(BaseModel):
 
 
 # ==========================================
-# 5. CRYPTOGRAPHY, CLEANUP & SUBTITLE HELPERS
+# 5. CRYPTOGRAPHY, CLEANUP & AUTH HELPERS
 # ==========================================
 def verify_password(plain_password: str, hashed_password: Optional[str]) -> bool:
     if not hashed_password:
@@ -228,230 +264,6 @@ def cleanup_temp_files(*filepaths: str) -> None:
                 os.remove(path)
             except Exception as e:
                 logger.warning(f"Temp file cleanup warning for {path}: {e}")
-
-def get_video_duration_seconds(filepath: str) -> float:
-    try:
-        res = subprocess.run(
-            [
-                "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                filepath
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=20
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            dur = float(res.stdout.strip())
-            if dur > 0:
-                return dur
-    except Exception as e:
-        logger.warning(f"ffprobe duration lookup fallback: {e}")
-    return CLIP_DURATION_SECONDS
-
-def _clean_subtitle_text(raw_text: str) -> str:
-    """Strips em/en/hyphen dashes, collapses whitespace, and formats clean uppercase caption text."""
-    text = raw_text or ""
-    text = text.replace("\u2014", " ").replace("\u2013", " ")
-    text = re.sub(r"(^|\s)[-–—]+(\s|$)", " ", text)
-    text = text.replace("-", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text.upper()
-
-def _detect_speech_segments(audio_path: str, duration_sec: float) -> List[Tuple[float, float]]:
-    """
-    Uses ffmpeg silencedetect to find active speech intervals (start, end)
-    relative to the clipped audio segment.
-    """
-    res = subprocess.run(
-        [
-            "ffmpeg", "-i", audio_path,
-            "-af", "silencedetect=noise=-28dB:d=0.35",
-            "-f", "null", "-"
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    stderr_out = res.stderr or ""
-    silence_starts: List[float] = []
-    silence_ends: List[float] = []
-
-    for line in stderr_out.splitlines():
-        m_start = re.search(r"silence_start:\s*([0-9.]+)", line)
-        if m_start:
-            silence_starts.append(float(m_start.group(1)))
-        m_end = re.search(r"silence_end:\s*([0-9.]+)", line)
-        if m_end:
-            silence_ends.append(float(m_end.group(1)))
-
-    # Pair silence intervals into non-silent speech intervals
-    speech_intervals: List[Tuple[float, float]] = []
-    cursor = 0.0
-    for idx, s_start in enumerate(silence_starts):
-        if s_start > cursor + 0.35:
-            speech_intervals.append((cursor, min(duration_sec, s_start)))
-        if idx < len(silence_ends):
-            cursor = max(cursor, silence_ends[idx])
-        else:
-            cursor = duration_sec
-
-    if cursor < duration_sec - 0.35:
-        speech_intervals.append((cursor, duration_sec))
-
-    # Split long speech stretches (> 4.5s) into ~3.5s chunks so subtitles keep pace with speech
-    chunks: List[Tuple[float, float]] = []
-    for sp_start, sp_end in speech_intervals:
-        seg_len = sp_end - sp_start
-        if seg_len <= 4.5:
-            chunks.append((sp_start, sp_end))
-        else:
-            sub_cursor = sp_start
-            while sub_cursor < sp_end - 0.35:
-                next_end = min(sp_end, sub_cursor + 3.5)
-                if next_end - sub_cursor >= 0.4:
-                    chunks.append((sub_cursor, next_end))
-                sub_cursor = next_end
-
-    return chunks
-
-def _distribute_words_over_span(words: List[str], span_start: float, span_end: float) -> List[Tuple[float, float, str]]:
-    """
-    Splits words into 3-5 word blocks and spans each block across the exact
-    duration that those words are spoken within [span_start, span_end].
-    """
-    if not words:
-        return []
-    span_dur = max(0.6, span_end - span_start)
-    if len(words) <= 5:
-        return [(span_start, span_end, " ".join(words))]
-
-    blocks: List[List[str]] = []
-    for i in range(0, len(words), 4):
-        blocks.append(words[i:i + 4])
-    if len(blocks) > 1 and len(blocks[-1]) == 1:
-        blocks[-2].extend(blocks[-1])
-        blocks.pop()
-
-    total_words = sum(len(b) for b in blocks)
-    cues: List[Tuple[float, float, str]] = []
-    cursor = span_start
-    for idx, blk in enumerate(blocks):
-        if idx == len(blocks) - 1:
-            end_t = span_end
-        else:
-            portion = (len(blk) / total_words) * span_dur
-            end_t = min(span_end, cursor + max(0.55, portion))
-        if end_t > cursor + 0.25:
-            cues.append((cursor, end_t, " ".join(blk)))
-        cursor = end_t
-
-    return cues
-
-def _format_srt_timestamp(seconds: float) -> str:
-    clamped = max(0.0, seconds)
-    hours = int(clamped // 3600)
-    minutes = int((clamped % 3600) // 60)
-    secs = int(clamped % 60)
-    millis = int(round((clamped - int(clamped)) * 1000))
-    if millis == 1000:
-        secs += 1
-        millis = 0
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_sec: float, srt_path: str) -> bool:
-    """
-    Extracts the clipped segment audio, detects spoken intervals, transcribes each spoken
-    interval, and times each subtitle block to the exact duration of the speech it represents.
-    """
-    try:
-        import speech_recognition as sr  # type: ignore
-    except ImportError:
-        logger.warning("SpeechRecognition package not installed; skipping subtitles.")
-        return False
-
-    full_seg_wav = f"{srt_path}_full.wav"
-    extract_res = subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-ss", f"{start_sec:.2f}",
-            "-t", f"{duration_sec:.2f}",
-            "-i", source_video_path,
-            "-vn", "-ac", "1", "-ar", "16000", full_seg_wav
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    if extract_res.returncode != 0 or not os.path.exists(full_seg_wav):
-        cleanup_temp_files(full_seg_wav)
-        return False
-
-    speech_spans = _detect_speech_segments(full_seg_wav, duration_sec)
-    if not speech_spans:
-        speech_spans = [(0.0, duration_sec)]
-
-    recognizer = sr.Recognizer()
-    recognizer.dynamic_energy_threshold = False
-    recognizer.energy_threshold = 180
-
-    cues: List[Tuple[float, float, str]] = []
-
-    for sp_start, sp_end in speech_spans:
-        sp_dur = sp_end - sp_start
-        if sp_dur < 0.4:
-            continue
-        span_wav = f"{srt_path}_{int(sp_start * 100)}_{int(sp_end * 100)}.wav"
-        cut_res = subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-ss", f"{sp_start:.2f}",
-                "-t", f"{sp_dur:.2f}",
-                "-i", full_seg_wav,
-                "-ac", "1", "-ar", "16000", span_wav
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        if cut_res.returncode == 0 and os.path.exists(span_wav):
-            try:
-                with sr.AudioFile(span_wav) as source:
-                    audio_data = recognizer.record(source)
-                raw_text = recognizer.recognize_google(audio_data, language="en-US")
-                cleaned = _clean_subtitle_text(raw_text)
-                if cleaned:
-                    cues.extend(_distribute_words_over_span(cleaned.split(), sp_start, sp_end))
-            except sr.UnknownValueError:
-                pass
-            except Exception as e:
-                logger.warning(f"Speech span transcription error ({sp_start:.2f}s-{sp_end:.2f}s): {e}")
-            finally:
-                cleanup_temp_files(span_wav)
-
-    cleanup_temp_files(full_seg_wav)
-
-    if not cues:
-        logger.info("No speech transcribed for clip segment.")
-        return False
-
-    try:
-        with open(srt_path, "w", encoding="utf-8") as f:
-            for idx, (s_sec, e_sec, txt) in enumerate(cues, start=1):
-                f.write(f"{idx}\n")
-                f.write(f"{_format_srt_timestamp(s_sec)} --> {_format_srt_timestamp(e_sec)}\n")
-                f.write(f"{txt}\n\n")
-        return True
-    except Exception as e:
-        logger.warning(f"Failed writing SRT file: {e}")
-        return False
-
-def _escape_ffmpeg_filter_path(path: str) -> str:
-    normalized = path.replace("\\", "/")
-    normalized = normalized.replace(":", "\\:").replace("'", "\\'")
-    return normalized
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
@@ -537,7 +349,9 @@ def health_check():
     return {
         "status": "online",
         "service": "ClipForge AI Backend",
-        "version": "3.7.0",
+        "version": "10.9.5",
+        "model": MODEL_SIZE,
+        "font": ensure_heavy_font(),
         "database": db_status,
         "timestamp_utc": datetime.utcnow().isoformat()
     }
@@ -713,7 +527,7 @@ def google_auth_endpoint(request: Request, data: GoogleAuthSchema):
 
 
 # ==========================================
-# 7. ACCOUNT LIFECYCLE & RENDER HISTORY ENDPOINTS
+# 7. ACCOUNT LIFECYCLE & RENDER PREVIEW ENDPOINTS
 # ==========================================
 @app.post("/api/account/schedule-deletion", tags=["Account Lifecycle"])
 @limiter.limit("5/minute")
@@ -744,6 +558,7 @@ def schedule_account_deletion_endpoint(request: Request, current_user: Dict[str,
 
 @app.get("/api/renders", tags=["Video Processing"])
 def list_user_renders_endpoint(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Returns metadata for the current user's recent vertical renders (without spending credits)."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -778,6 +593,7 @@ def stream_saved_render_endpoint(
     download: bool = False,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
+    """Streams a previously rendered vertical clip for preview or download without deducting credits."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -796,7 +612,7 @@ def stream_saved_render_endpoint(
     video_bytes = base64.b64decode(row["video_b64"])
     headers = {}
     if download:
-        headers["Content-Disposition"] = 'attachment; filename="clipforge_vertical_highlight.mp4"'
+        headers["Content-Disposition"] = 'attachment; filename="vertical_clip.mp4"'
 
     return StreamingResponse(
         io.BytesIO(video_bytes),
@@ -837,92 +653,223 @@ async def upload_and_clip_endpoint(
         )
 
     ACTIVE_USER_JOBS.add(user_email)
-    job_identifier = os.urandom(6).hex()
-    input_filepath = f"input_{job_identifier}.mp4"
-    output_filepath = f"output_{job_identifier}.mp4"
-    srt_filepath = f"subs_{job_identifier}.srt"
+    job_id = os.urandom(6).hex()
+    safe_upload_name = os.path.basename(file.filename or f"upload_{job_id}.mp4")
+    input_video_path = f"/tmp/input_{job_id}_{safe_upload_name}"
+    slice_video_path = f"/tmp/slice_{job_id}_{os.getpid()}.mp4"
+    audio_wav_path = f"/tmp/audio_{job_id}_{os.getpid()}.wav"
+    output_path = f"/tmp/clip_output_{job_id}_{os.getpid()}.mp4"
+
+    all_temp_files = [input_video_path, slice_video_path, audio_wav_path, output_path]
+    cleanup_temp_files(*all_temp_files)
 
     written_bytes = 0
     try:
-        with open(input_filepath, "wb") as buffer_file:
+        with open(input_video_path, "wb") as buffer:
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
                 written_bytes += len(chunk)
                 if written_bytes > MAX_FILE_SIZE_BYTES:
-                    buffer_file.close()
-                    cleanup_temp_files(input_filepath, srt_filepath)
+                    buffer.close()
+                    cleanup_temp_files(*all_temp_files)
                     raise HTTPException(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail="Uploaded file exceeds the maximum permitted size limit of 250MB."
                     )
-                buffer_file.write(chunk)
+                buffer.write(chunk)
     except HTTPException:
         ACTIVE_USER_JOBS.discard(user_email)
         raise
-    except Exception:
-        cleanup_temp_files(input_filepath, srt_filepath)
+    except Exception as e:
+        cleanup_temp_files(*all_temp_files)
         ACTIVE_USER_JOBS.discard(user_email)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Failed to read uploaded file."
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {str(e)}")
 
-    if written_bytes == 0:
-        cleanup_temp_files(input_filepath, srt_filepath)
+    if not os.path.exists(input_video_path) or os.path.getsize(input_video_path) == 0:
+        cleanup_temp_files(*all_temp_files)
         ACTIVE_USER_JOBS.discard(user_email)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Uploaded file is empty."
-        )
+        raise HTTPException(status_code=400, detail="Uploaded file is empty or missing.")
 
     try:
-        total_duration = get_video_duration_seconds(input_filepath)
-        clip_len = min(CLIP_DURATION_SECONDS, total_duration) if total_duration > 0 else CLIP_DURATION_SECONDS
-        max_start = max(0.0, total_duration - clip_len)
-        start_sec = round(random.uniform(0.0, max_start), 2) if max_start > 0 else 0.0
+        # 1. Get full video duration
+        duration = 35.0
+        try:
+            probe_cmd = [
+                "ffprobe", "-v", "error", "-show_entries",
+                "format=duration", "-of",
+                "default=noprint_wrappers=1:nokey=1", input_video_path
+            ]
+            res = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if res.returncode == 0 and res.stdout.strip():
+                duration = float(res.stdout.strip())
+        except Exception:
+            pass
 
-        has_subs = generate_subtitles_srt(input_filepath, start_sec, clip_len, srt_filepath)
+        # 2. Pick a random start time anywhere in the video for a 30s-45s clip snippet
+        clip_duration = min(duration, CLIP_DURATION_SECONDS)
+        max_start = max(0.0, duration - clip_duration)
+        start_time = random.uniform(0.0, max_start) if max_start > 0 else 0.0
 
-        # Full-frame 9:16 portrait letterbox with black bars on top/bottom and zero cutting.
-        vf_chain = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
-        if has_subs and os.path.exists(srt_filepath):
-            escaped_srt = _escape_ffmpeg_filter_path(srt_filepath)
-            vf_chain += (
-                f",subtitles='{escaped_srt}':force_style="
-                "'PlayResX=1080,PlayResY=1920,FontName=Arial,FontSize=54,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=4,Shadow=0,Alignment=2,MarginV=565,MarginL=50,MarginR=50'"
-            )
+        # 3. Quickly slice the video snippet first using FFmpeg (zero RAM usage)
+        try:
+            slice_cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start_time),
+                "-i", input_video_path,
+                "-t", str(clip_duration),
+                "-c", "copy",
+                slice_video_path
+            ]
+            res = subprocess.run(slice_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode != 0 or not os.path.exists(slice_video_path) or os.path.getsize(slice_video_path) == 0:
+                slice_cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start_time),
+                    "-i", input_video_path,
+                    "-t", str(clip_duration),
+                    slice_video_path
+                ]
+                subprocess.run(slice_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Video slicing failed: {str(e)}")
 
-        ffmpeg_command = [
-            "ffmpeg", "-y", "-threads", "2",
-            "-ss", f"{start_sec:.2f}",
-            "-i", input_filepath,
-            "-t", f"{clip_len:.2f}",
-            "-vf", vf_chain,
-            "-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-crf", "24",
-            "-movflags", "+faststart",
-            "-c:a", "aac", "-b:a", "128k", output_filepath
+        # 4. Extract audio ONLY from this small slice (tiny file size, zero RAM pressure)
+        try:
+            extract_cmd = [
+                "ffmpeg", "-y", "-i", slice_video_path,
+                "-ar", "16000", "-ac", "1", audio_wav_path
+            ]
+            subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
+
+        # 5. Run Whisper on the lightweight slice audio (stays safely under 512MB RAM)
+        raw_word_list: List[Dict[str, Any]] = []
+        model = get_whisper_model()
+
+        if model and os.path.exists(audio_wav_path):
+            try:
+                segments, _ = model.transcribe(
+                    audio_wav_path,
+                    word_timestamps=True,
+                    beam_size=1,
+                    vad_filter=True,
+                    condition_on_previous_text=False
+                )
+                for segment in segments:
+                    if hasattr(segment, "words") and segment.words:
+                        for w in segment.words:
+                            raw_w = w.word.strip()
+                            clean_w = re.sub(r"[^a-zA-Z0-9\$\'\,\s\?\!]", "", raw_w).strip()
+                            if clean_w:
+                                raw_word_list.append({
+                                    "start": float(w.start),
+                                    "end": float(w.end),
+                                    "text": clean_w.upper()
+                                })
+            except Exception as e:
+                logger.error(f"Whisper transcription error: {e}")
+
+        # 1. Merge split number/comma tokens (e.g. "100" and ",000" -> "100,000")
+        merged_list: List[Dict[str, Any]] = []
+        for w in raw_word_list:
+            if merged_list and (w["text"].startswith(",") or w["text"] == ","):
+                merged_list[-1]["text"] += w["text"]
+                merged_list[-1]["end"] = w["end"]
+            else:
+                merged_list.append(w)
+
+        # 2. Strip useless "A " before dollar amounts (e.g., "A $250,000" -> "$250,000")
+        word_timed_list: List[Dict[str, Any]] = []
+        i = 0
+        while i < len(merged_list):
+            curr = merged_list[i]
+            if curr["text"] == "A" and i + 1 < len(merged_list) and merged_list[i + 1]["text"].startswith("$"):
+                next_token = merged_list[i + 1]
+                next_token["start"] = curr["start"]
+                word_timed_list.append(next_token)
+                i += 2
+            else:
+                word_timed_list.append(curr)
+                i += 1
+
+        if not word_timed_list:
+            word_timed_list = [
+                {"start": 0.0, "end": clip_duration, "text": "CLIPFORGE AI"}
+            ]
+
+        font_file = ensure_heavy_font()
+
+        # Intelligent Word Grouping into Reader-Friendly Chunks (Max 3-4 words)
+        chunked_subtitles: List[Dict[str, Any]] = []
+        current_chunk: List[str] = []
+        chunk_start: Optional[float] = None
+
+        for w in word_timed_list:
+            if not current_chunk:
+                chunk_start = w["start"]
+            current_chunk.append(w["text"])
+
+            if len(current_chunk) >= 3 or len(" ".join(current_chunk)) > 16:
+                chunked_subtitles.append({
+                    "start": round(chunk_start, 2),
+                    "end": round(w["end"], 2),
+                    "text": " ".join(current_chunk)
+                })
+                current_chunk = []
+
+        if current_chunk and chunk_start is not None:
+            chunked_subtitles.append({
+                "start": round(chunk_start, 2),
+                "end": round(word_timed_list[-1]["end"], 2),
+                "text": " ".join(current_chunk)
+            })
+
+        vf_filters = [
+            "scale=1080:1920:force_original_aspect_ratio=decrease",
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
         ]
 
-        process_result = subprocess.run(
-            ffmpeg_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        if process_result.returncode != 0:
-            logger.error(f"FFmpeg error for {user_email}: {process_result.stderr[-300:]}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Video rendering failed due to an invalid stream or codec."
+        for sub in chunked_subtitles:
+            safe_text = sub["text"].replace("'", "").replace(":", "\\:").replace("%", "%%").replace('"', "")
+            draw_filter = (
+                f"drawtext=text='{safe_text}':"
+                f"fontfile={font_file}:"
+                f"fontsize=52:fontcolor=white:"
+                f"borderw=5:bordercolor=black:"
+                f"shadowx=2:shadowy=2:shadowcolor=black@1.0:"
+                f"x=(w-text_w)/2:y=1300:"
+                f"enable='between(t,{sub['start']},{sub['end']})'"
             )
+            vf_filters.append(draw_filter)
 
-        output_size = os.path.getsize(output_filepath)
+        video_filter = ",".join(vf_filters)
+
+        # 6. Final render on the already-sliced video snippet
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-i", slice_video_path,
+            "-vf", video_filter,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "22",
+            "-threads", "2",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            output_path
+        ]
+
+        ff_res = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if ff_res.returncode != 0 or not os.path.exists(output_path):
+            ff_err = ff_res.stderr.decode("utf-8", errors="ignore")
+            raise HTTPException(status_code=500, detail=f"FFmpeg rendering failed: {ff_err[-300:]}")
+
+        output_size = os.path.getsize(output_path)
         encoded_video = None
         if output_size <= MAX_STORED_RENDER_BYTES:
-            with open(output_filepath, "rb") as out_f:
+            with open(output_path, "rb") as out_f:
                 encoded_video = base64.b64encode(out_f.read()).decode("utf-8")
 
         conn = get_db_connection()
@@ -958,22 +905,17 @@ async def upload_and_clip_endpoint(
             conn.close()
 
         del encoded_video
-        background_tasks.add_task(cleanup_temp_files, input_filepath, output_filepath, srt_filepath)
 
-        return FileResponse(
-            output_filepath,
-            media_type="video/mp4",
-            filename="clipforge_vertical_highlight.mp4"
-        )
+        if background_tasks:
+            background_tasks.add_task(cleanup_temp_files, *all_temp_files)
+
+        return FileResponse(output_path, media_type="video/mp4", filename="vertical_clip.mp4")
 
     except Exception as err:
-        cleanup_temp_files(input_filepath, output_filepath, srt_filepath)
+        cleanup_temp_files(*all_temp_files)
         if isinstance(err, HTTPException):
             raise err
         logger.error(f"Unexpected error clipping video for {user_email}: {str(err)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred during clip generation."
-        )
+        raise HTTPException(status_code=500, detail=f"Clip generation failed: {str(err)}")
     finally:
         ACTIVE_USER_JOBS.discard(user_email)
