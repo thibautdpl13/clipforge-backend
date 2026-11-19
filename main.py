@@ -158,7 +158,8 @@ def startup_db_initialization() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Safe column additions for backward compatibility
+        # Safe column additions for existing tables created before id/migrations existed
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS id SERIAL UNIQUE;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS age_verified BOOLEAN DEFAULT FALSE;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_scheduled_at TIMESTAMP DEFAULT NULL;")
@@ -307,7 +308,7 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, A
 # ==========================================
 # 6. API ROUTE ENDPOINTS: HEALTH & AUTH
 # ==========================================
-@app.get("/", tags=["Health"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["Health"])
 @app.get("/health", tags=["Health"])
 def health_check():
     """Uptime monitoring endpoint verifying API and database responsiveness."""
