@@ -2,7 +2,6 @@ import os
 import io
 import time
 import base64
-import shutil
 import logging
 import subprocess
 from datetime import datetime, timedelta
@@ -33,7 +32,7 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clipforge_super_secure_secret_key_prod
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7       # 7 days valid access token
 MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024          # Strict 250MB upload cap
-MAX_STORED_RENDER_BYTES = 10 * 1024 * 1024       # Cap DB history blob size at 10MB per render to protect RAM
+MAX_STORED_RENDER_BYTES = 10 * 1024 * 1024       # Cap DB history blob size at 10MB to protect RAM
 ALLOWED_VIDEO_MIME_TYPES: Set[str] = {
     "video/mp4",
     "video/quicktime",
@@ -159,7 +158,7 @@ def startup_db_initialization() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Safe column additions for existing tables created before id/migrations existed
+        # Safe column additions for existing tables
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS id SERIAL UNIQUE;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS age_verified BOOLEAN DEFAULT FALSE;")
@@ -638,7 +637,6 @@ async def upload_and_clip_endpoint(
     input_filepath = f"input_{job_identifier}.mp4"
     output_filepath = f"output_{job_identifier}.mp4"
 
-    # Stream upload directly to disk in chunks so large files don't fill RAM
     written_bytes = 0
     try:
         with open(input_filepath, "wb") as buffer_file:
@@ -675,7 +673,7 @@ async def upload_and_clip_endpoint(
         )
 
     try:
-        # Optimized FFmpeg vertical crop and H.264 web compression with bounded thread count
+        # Optimized FFmpeg vertical crop and H.264 web compression
         ffmpeg_command = [
             "ffmpeg", "-y", "-threads", "2", "-i", input_filepath,
             "-ss", "00:00:00", "-to", "00:00:30",
@@ -751,4 +749,16 @@ async def upload_and_clip_endpoint(
         cleanup_temp_files(input_filepath, output_filepath)
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Video processing timed out. Try uploading a shorter
+            detail="Video processing timed out. Try uploading a shorter clip."
+        )
+    except Exception as err:
+        cleanup_temp_files(input_filepath, output_filepath)
+        if isinstance(err, HTTPException):
+            raise err
+        logger.error(f"Unexpected error clipping video for {user_email}: {str(err)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred during clip generation."
+        )
+    finally:
+        ACTIVE_USER_JOBS.discard(user_email)
