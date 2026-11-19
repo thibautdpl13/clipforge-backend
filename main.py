@@ -2,6 +2,7 @@ import os
 import io
 import time
 import base64
+import shutil
 import logging
 import subprocess
 from datetime import datetime, timedelta
@@ -32,7 +33,7 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clipforge_super_secure_secret_key_prod
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7       # 7 days valid access token
 MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024          # Strict 250MB upload cap
-MAX_STORED_RENDER_BYTES = 25 * 1024 * 1024       # Cap DB history blob size at 25MB per render
+MAX_STORED_RENDER_BYTES = 10 * 1024 * 1024       # Cap DB history blob size at 10MB per render to protect RAM
 ALLOWED_VIDEO_MIME_TYPES: Set[str] = {
     "video/mp4",
     "video/quicktime",
@@ -626,19 +627,6 @@ async def upload_and_clip_endpoint(
             detail=f"Unsupported file type '{file.content_type}'. Allowed formats: MP4, MOV, WebM."
         )
 
-    file_contents = await file.read()
-    if len(file_contents) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Uploaded file is empty."
-        )
-
-    if len(file_contents) > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="Uploaded file exceeds the maximum permitted size limit of 250MB."
-        )
-
     if current_user["clips_remaining"] <= 0:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -650,16 +638,49 @@ async def upload_and_clip_endpoint(
     input_filepath = f"input_{job_identifier}.mp4"
     output_filepath = f"output_{job_identifier}.mp4"
 
-    with open(input_filepath, "wb") as buffer_file:
-        buffer_file.write(file_contents)
+    # Stream upload directly to disk in chunks so large files don't fill RAM
+    written_bytes = 0
+    try:
+        with open(input_filepath, "wb") as buffer_file:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written_bytes += len(chunk)
+                if written_bytes > MAX_FILE_SIZE_BYTES:
+                    buffer_file.close()
+                    cleanup_temp_files(input_filepath)
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="Uploaded file exceeds the maximum permitted size limit of 250MB."
+                    )
+                buffer_file.write(chunk)
+    except HTTPException:
+        ACTIVE_USER_JOBS.discard(user_email)
+        raise
+    except Exception:
+        cleanup_temp_files(input_filepath)
+        ACTIVE_USER_JOBS.discard(user_email)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to read uploaded file."
+        )
+
+    if written_bytes == 0:
+        cleanup_temp_files(input_filepath)
+        ACTIVE_USER_JOBS.discard(user_email)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty."
+        )
 
     try:
-        # Optimized FFmpeg vertical crop and H.264 web compression
+        # Optimized FFmpeg vertical crop and H.264 web compression with bounded thread count
         ffmpeg_command = [
-            "ffmpeg", "-y", "-i", input_filepath,
+            "ffmpeg", "-y", "-threads", "2", "-i", input_filepath,
             "-ss", "00:00:00", "-to", "00:00:30",
             "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "24",
+            "-c:v", "libx264", "-threads", "2", "-preset", "fast", "-crf", "24",
             "-movflags", "+faststart",
             "-c:a", "aac", "-b:a", "128k", output_filepath
         ]
@@ -717,6 +738,7 @@ async def upload_and_clip_endpoint(
             cur.close()
             conn.close()
 
+        del encoded_video
         background_tasks.add_task(cleanup_temp_files, input_filepath, output_filepath)
 
         return FileResponse(
@@ -729,16 +751,4 @@ async def upload_and_clip_endpoint(
         cleanup_temp_files(input_filepath, output_filepath)
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Video processing timed out. Try uploading a shorter clip."
-        )
-    except Exception as err:
-        cleanup_temp_files(input_filepath, output_filepath)
-        if isinstance(err, HTTPException):
-            raise err
-        logger.error(f"Unexpected error clipping video for {user_email}: {str(err)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred during clip generation."
-        )
-    finally:
-        ACTIVE_USER_JOBS.discard(user_email)
+            detail="Video processing timed out. Try uploading a shorter
