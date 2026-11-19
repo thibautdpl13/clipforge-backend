@@ -54,7 +54,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ClipForge AI Production Backend",
     description="Automated video clipping, JWT authentication, rate limiting, and compliance backend engine.",
-    version="3.2.0",
+    version="3.2.1",
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None
 )
@@ -268,7 +268,6 @@ def get_video_duration_seconds(filepath: str) -> float:
 def _clean_subtitle_text(raw_text: str) -> str:
     """Removes em/en/hyphen dashes, strips whitespace, and formats clean uppercase caption text."""
     text = raw_text or ""
-    # Remove em-dash, en-dash, and speaker leading/joining dashes
     text = text.replace("\u2014", " ").replace("\u2013", " ")
     text = re.sub(r"(^|\s)[-–—]+(\s|$)", " ", text)
     text = text.replace("-", " ")
@@ -283,8 +282,7 @@ def _normalize_segments(raw_segments: List[Tuple[float, float, str]], duration_s
         if not norm_txt:
             continue
         start_c = max(0.0, min(duration_sec - 0.5, float(s_sec)))
-        end_c = max(start_c + 1.1, min(duration_sec, float(e_sec)))
-        # Ensure minimum readability duration of ~1.2s
+        end_c = max(start_c + 1.2, min(duration_sec, float(e_sec)))
         if end_c - start_c < 1.2:
             end_c = min(duration_sec, start_c + 1.2)
         cleaned.append((start_c, end_c, norm_txt))
@@ -292,7 +290,6 @@ def _normalize_segments(raw_segments: List[Tuple[float, float, str]], duration_s
     if not cleaned:
         return []
 
-    # Merge tiny consecutive fragments so lines don't flash for a split second
     merged: List[Tuple[float, float, str]] = []
     for s_sec, e_sec, txt in cleaned:
         if merged:
@@ -307,13 +304,12 @@ def _normalize_segments(raw_segments: List[Tuple[float, float, str]], duration_s
                 continue
         merged.append((s_sec, e_sec, txt))
 
-    # Prevent overlap between adjacent cues while preserving full cue duration
     final_cues: List[Tuple[float, float, str]] = []
     for idx, (s_sec, e_sec, txt) in enumerate(merged):
         adjusted_s = s_sec
         if final_cues and adjusted_s < final_cues[-1][1] + 0.05:
             adjusted_s = min(duration_sec - 0.8, final_cues[-1][1] + 0.05)
-        adjusted_e = max(adjusted_s + 1.1, min(duration_sec, e_sec))
+        adjusted_e = max(adjusted_s + 1.2, min(duration_sec, e_sec))
         if idx + 1 < len(merged) and adjusted_e > merged[idx + 1][0] - 0.05:
             adjusted_e = max(adjusted_s + 0.9, merged[idx + 1][0] - 0.05)
         final_cues.append((adjusted_s, adjusted_e, txt))
@@ -333,58 +329,59 @@ def _format_srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_sec: float, srt_path: str) -> bool:
-    """Transcribes the clipped segment if faster-whisper or whisper is installed and writes a clean SRT file."""
+    """Transcribes the clipped segment using faster-whisper (or whisper) and writes a clean SRT file."""
     raw_segments: List[Tuple[float, float, str]] = []
+    audio_tmp = f"{srt_path}_seg.wav"
+
+    extract_res = subprocess.run(
+        [
+            "ffmpeg", "-y", "-ss", f"{start_sec:.2f}", "-t", f"{duration_sec:.2f}",
+            "-i", source_video_path, "-vn", "-ac", "1", "-ar", "16000", audio_tmp
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    if extract_res.returncode != 0 or not os.path.exists(audio_tmp):
+        logger.warning("Subtitle audio extraction failed or video has no audio track.")
+        cleanup_temp_files(audio_tmp)
+        return False
 
     try:
-        from faster_whisper import WhisperModel  # type: ignore
-        model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        segments_iter, _ = model.transcribe(
-            source_video_path,
-            clip_timestamps=[start_sec, start_sec + duration_sec],
-            vad_filter=True
-        )
-        for seg in segments_iter:
-            text = (seg.text or "").strip()
-            if text:
-                rel_start = float(seg.start) - start_sec
-                rel_end = float(seg.end) - start_sec
-                raw_segments.append((rel_start, rel_end, text))
-    except ImportError:
         try:
-            import whisper  # type: ignore
-            audio_tmp = f"{srt_path}_seg.wav"
-            extract_res = subprocess.run(
-                [
-                    "ffmpeg", "-y", "-ss", f"{start_sec:.2f}", "-t", f"{duration_sec:.2f}",
-                    "-i", source_video_path, "-vn", "-ac", "1", "-ar", "16000", audio_tmp
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            if extract_res.returncode == 0 and os.path.exists(audio_tmp):
-                model = whisper.load_model("tiny", device="cpu")
-                result = model.transcribe(audio_tmp, fp16=False)
-                for seg in result.get("segments", []):
-                    text = (seg.get("text") or "").strip()
-                    if text:
-                        rel_start = float(seg.get("start", 0.0))
-                        rel_end = float(seg.get("end", rel_start + 1.2))
-                        raw_segments.append((rel_start, rel_end, text))
-                cleanup_temp_files(audio_tmp)
+            from faster_whisper import WhisperModel  # type: ignore
+            model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            segments_iter, _ = model.transcribe(audio_tmp, vad_filter=True)
+            for seg in segments_iter:
+                text = (seg.text or "").strip()
+                if text:
+                    raw_segments.append((float(seg.start), float(seg.end), text))
         except ImportError:
-            return False
-        except Exception as e:
-            logger.warning(f"Whisper transcription failed: {e}")
-            cleanup_temp_files(f"{srt_path}_seg.wav")
-            return False
-    except Exception as e:
-        logger.warning(f"faster-whisper transcription failed: {e}")
+            import whisper  # type: ignore
+            model = whisper.load_model("tiny", device="cpu")
+            result = model.transcribe(audio_tmp, fp16=False)
+            for seg in result.get("segments", []):
+                text = (seg.get("text") or "").strip()
+                if text:
+                    raw_segments.append((
+                        float(seg.get("start", 0.0)),
+                        float(seg.get("end", float(seg.get("start", 0.0)) + 1.2)),
+                        text
+                    ))
+    except ImportError:
+        logger.warning("No Whisper package installed; skipping subtitles.")
+        cleanup_temp_files(audio_tmp)
         return False
+    except Exception as e:
+        logger.warning(f"Whisper transcription error: {e}")
+        cleanup_temp_files(audio_tmp)
+        return False
+
+    cleanup_temp_files(audio_tmp)
 
     cues = _normalize_segments(raw_segments, duration_sec)
     if not cues:
+        logger.info("No speech segments detected in selected clip window.")
         return False
 
     try:
@@ -490,7 +487,7 @@ def health_check():
     return {
         "status": "online",
         "service": "ClipForge AI Backend",
-        "version": "3.2.0",
+        "version": "3.2.1",
         "database": db_status,
         "timestamp_utc": datetime.utcnow().isoformat()
     }
@@ -847,8 +844,6 @@ async def upload_and_clip_endpoint(
         has_subs = generate_subtitles_srt(input_filepath, start_sec, clip_len, srt_filepath)
 
         # Full-frame 9:16 portrait letterbox with black bars on top/bottom and zero cutting
-        # For a 16:9 (1080x608) video inside 1080x1920, the bottom black bar spans y=1264..1920;
-        # MarginV=260 places bold uppercase captions cleanly along the top edge of the bottom black bar.
         vf_chain = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         if has_subs and os.path.exists(srt_filepath):
             escaped_srt = _escape_ffmpeg_filter_path(srt_filepath)
