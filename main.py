@@ -1,13 +1,14 @@
 import os
+import io
 import time
+import base64
 import logging
-import hashlib
 import subprocess
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Set
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends, status, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -31,6 +32,7 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clipforge_super_secure_secret_key_prod
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7       # 7 days valid access token
 MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024          # Strict 250MB upload cap
+MAX_STORED_RENDER_BYTES = 25 * 1024 * 1024       # Cap DB history blob size at 25MB per render
 ALLOWED_VIDEO_MIME_TYPES: Set[str] = {
     "video/mp4",
     "video/quicktime",
@@ -97,7 +99,7 @@ async def add_security_and_timing_headers(request: Request, call_next):
     response.headers["Content-Security-Policy"] = (
         "default-src 'self' https://cdn.tailwindcss.com https://accounts.google.com https://*.googleapis.com https://*.gstatic.com; "
         "img-src 'self' data: blob: https:; "
-        "media-src 'self' blob: data:; "
+        "media-src 'self' blob: data: https://clipforge-backend-4t73.onrender.com; "
         "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://accounts.google.com https://*.googleapis.com; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src 'self' https://fonts.gstatic.com;"
@@ -161,9 +163,21 @@ def startup_db_initialization() -> None:
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS age_verified BOOLEAN DEFAULT FALSE;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_scheduled_at TIMESTAMP DEFAULT NULL;")
 
+        # Recent renders history table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS renders (
+                id SERIAL PRIMARY KEY,
+                user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                source_filename VARCHAR(255) NOT NULL,
+                video_b64 TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         # Database performance indexes
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_deletion_scheduled ON users (deletion_scheduled_at) WHERE deletion_scheduled_at IS NOT NULL;")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_renders_user_created ON renders (user_id, created_at DESC);")
 
         conn.commit()
         logger.info("Database schema and indexes verified successfully.")
@@ -488,7 +502,7 @@ def google_auth_endpoint(request: Request, data: GoogleAuthSchema):
 
 
 # ==========================================
-# 7. ACCOUNT LIFECYCLE MANAGEMENT ENDPOINTS
+# 7. ACCOUNT LIFECYCLE & RENDER HISTORY ENDPOINTS
 # ==========================================
 @app.post("/api/account/schedule-deletion", tags=["Account Lifecycle"])
 @limiter.limit("5/minute")
@@ -516,6 +530,71 @@ def schedule_account_deletion_endpoint(request: Request, current_user: Dict[str,
         "formatted_date": formatted_dt,
         "message": f"Account deletion is scheduled for {formatted_dt}."
     }
+
+
+@app.get("/api/renders", tags=["Video Processing"])
+def list_user_renders_endpoint(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Returns metadata for the current user's recent vertical renders (without spending credits)."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT id, source_filename, created_at
+               FROM renders
+               WHERE user_id = %s
+               ORDER BY created_at DESC
+               LIMIT 10;""",
+            (current_user["id"],)
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    return {
+        "renders": [
+            {
+                "id": r["id"],
+                "source_filename": r["source_filename"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/api/renders/{render_id}/video", tags=["Video Processing"])
+def stream_saved_render_endpoint(
+    render_id: int,
+    download: bool = False,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Streams a previously rendered vertical clip for preview or download without deducting credits."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id, source_filename, video_b64 FROM renders WHERE id = %s AND user_id = %s;",
+            (render_id, current_user["id"])
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Render not found.")
+
+    video_bytes = base64.b64decode(row["video_b64"])
+    headers = {}
+    if download:
+        headers["Content-Disposition"] = 'attachment; filename="clipforge_vertical_highlight.mp4"'
+
+    return StreamingResponse(
+        io.BytesIO(video_bytes),
+        media_type="video/mp4",
+        headers=headers
+    )
 
 
 # ==========================================
@@ -559,7 +638,7 @@ async def upload_and_clip_endpoint(
             detail="Uploaded file exceeds the maximum permitted size limit of 250MB."
         )
 
-    if current_user["clips_remaining"] <= 0 and current_user["tier"] != "agency":
+    if current_user["clips_remaining"] <= 0:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No remaining clip credits available. Please upgrade your subscription tier."
@@ -599,16 +678,39 @@ async def upload_and_clip_endpoint(
                 detail="Video rendering failed due to an invalid stream or codec."
             )
 
+        output_size = os.path.getsize(output_filepath)
+        encoded_video = None
+        if output_size <= MAX_STORED_RENDER_BYTES:
+            with open(output_filepath, "rb") as out_f:
+                encoded_video = base64.b64encode(out_f.read()).decode("utf-8")
+
         conn = get_db_connection()
         cur = conn.cursor()
         try:
-            updated_credits = max(0, current_user["clips_remaining"] - 1) if current_user["tier"] != "agency" else current_user["clips_remaining"]
+            updated_credits = max(0, current_user["clips_remaining"] - 1)
             updated_tier = "free_used" if current_user["tier"] in ("free", "demo") else current_user["tier"]
 
             cur.execute(
                 "UPDATE users SET clips_remaining = %s, tier = %s WHERE email = %s;",
                 (updated_credits, updated_tier, user_email)
             )
+
+            if encoded_video:
+                safe_name = (file.filename or "clip.mp4")[-240:]
+                cur.execute(
+                    """INSERT INTO renders (user_id, source_filename, video_b64)
+                       VALUES (%s, %s, %s);""",
+                    (current_user["id"], safe_name, encoded_video)
+                )
+                cur.execute(
+                    """DELETE FROM renders
+                       WHERE user_id = %s
+                         AND id NOT IN (
+                             SELECT id FROM renders WHERE user_id = %s ORDER BY created_at DESC LIMIT 10
+                         );""",
+                    (current_user["id"], current_user["id"])
+                )
+
             conn.commit()
         finally:
             cur.close()
