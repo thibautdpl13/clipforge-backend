@@ -7,7 +7,7 @@ import random
 import logging
 import subprocess
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Set, List
+from typing import Optional, Dict, Any, Set, List, Tuple
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends, status, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -35,7 +35,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7       # 7 days valid access token
 MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024          # Strict 250MB upload cap
 MAX_STORED_RENDER_BYTES = 10 * 1024 * 1024       # Cap DB history blob size at 10MB to protect RAM
-CLIP_DURATION_SECONDS = 30.0
+CLIP_DURATION_SECONDS = 45.0
 ALLOWED_VIDEO_MIME_TYPES: Set[str] = {
     "video/mp4",
     "video/quicktime",
@@ -54,7 +54,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ClipForge AI Production Backend",
     description="Automated video clipping, JWT authentication, rate limiting, and compliance backend engine.",
-    version="3.1.0",
+    version="3.2.0",
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None
 )
@@ -243,7 +243,7 @@ def cleanup_temp_files(*filepaths: str) -> None:
                 logger.warning(f"Temp file cleanup warning for {path}: {e}")
 
 def get_video_duration_seconds(filepath: str) -> float:
-    """Gets video duration in seconds using ffprobe; falls back to 30.0s if unavailable."""
+    """Gets video duration in seconds using ffprobe; falls back to default clip length."""
     try:
         res = subprocess.run(
             [
@@ -265,6 +265,61 @@ def get_video_duration_seconds(filepath: str) -> float:
         logger.warning(f"ffprobe duration lookup fallback: {e}")
     return CLIP_DURATION_SECONDS
 
+def _clean_subtitle_text(raw_text: str) -> str:
+    """Removes em/en/hyphen dashes, strips whitespace, and formats clean uppercase caption text."""
+    text = raw_text or ""
+    # Remove em-dash, en-dash, and speaker leading/joining dashes
+    text = text.replace("\u2014", " ").replace("\u2013", " ")
+    text = re.sub(r"(^|\s)[-–—]+(\s|$)", " ", text)
+    text = text.replace("-", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.upper()
+
+def _normalize_segments(raw_segments: List[Tuple[float, float, str]], duration_sec: float) -> List[Tuple[float, float, str]]:
+    """Smooths short or quick-flashing subtitle segments so each caption stays readable on screen."""
+    cleaned: List[Tuple[float, float, str]] = []
+    for s_sec, e_sec, txt in raw_segments:
+        norm_txt = _clean_subtitle_text(txt)
+        if not norm_txt:
+            continue
+        start_c = max(0.0, min(duration_sec - 0.5, float(s_sec)))
+        end_c = max(start_c + 1.1, min(duration_sec, float(e_sec)))
+        # Ensure minimum readability duration of ~1.2s
+        if end_c - start_c < 1.2:
+            end_c = min(duration_sec, start_c + 1.2)
+        cleaned.append((start_c, end_c, norm_txt))
+
+    if not cleaned:
+        return []
+
+    # Merge tiny consecutive fragments so lines don't flash for a split second
+    merged: List[Tuple[float, float, str]] = []
+    for s_sec, e_sec, txt in cleaned:
+        if merged:
+            prev_s, prev_e, prev_txt = merged[-1]
+            gap = s_sec - prev_e
+            combined_words = len((prev_txt + " " + txt).split())
+            if gap <= 0.45 and (len(prev_txt.split()) <= 3 or len(txt.split()) <= 2) and combined_words <= 7:
+                new_e = max(prev_e, e_sec)
+                if new_e - prev_s < 1.2:
+                    new_e = min(duration_sec, prev_s + 1.2)
+                merged[-1] = (prev_s, new_e, f"{prev_txt} {txt}")
+                continue
+        merged.append((s_sec, e_sec, txt))
+
+    # Prevent overlap between adjacent cues while preserving full cue duration
+    final_cues: List[Tuple[float, float, str]] = []
+    for idx, (s_sec, e_sec, txt) in enumerate(merged):
+        adjusted_s = s_sec
+        if final_cues and adjusted_s < final_cues[-1][1] + 0.05:
+            adjusted_s = min(duration_sec - 0.8, final_cues[-1][1] + 0.05)
+        adjusted_e = max(adjusted_s + 1.1, min(duration_sec, e_sec))
+        if idx + 1 < len(merged) and adjusted_e > merged[idx + 1][0] - 0.05:
+            adjusted_e = max(adjusted_s + 0.9, merged[idx + 1][0] - 0.05)
+        final_cues.append((adjusted_s, adjusted_e, txt))
+
+    return final_cues
+
 def _format_srt_timestamp(seconds: float) -> str:
     """Formats seconds into SRT timestamp HH:MM:SS,mmm."""
     clamped = max(0.0, seconds)
@@ -278,23 +333,23 @@ def _format_srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_sec: float, srt_path: str) -> bool:
-    """Transcribes the clipped segment if faster-whisper or whisper is installed and writes an SRT file."""
-    segments_data: List[tuple] = []
+    """Transcribes the clipped segment if faster-whisper or whisper is installed and writes a clean SRT file."""
+    raw_segments: List[Tuple[float, float, str]] = []
 
     try:
         from faster_whisper import WhisperModel  # type: ignore
         model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        raw_segments, _ = model.transcribe(
+        segments_iter, _ = model.transcribe(
             source_video_path,
             clip_timestamps=[start_sec, start_sec + duration_sec],
             vad_filter=True
         )
-        for seg in raw_segments:
+        for seg in segments_iter:
             text = (seg.text or "").strip()
             if text:
-                rel_start = max(0.0, float(seg.start) - start_sec)
-                rel_end = min(duration_sec, max(rel_start + 0.4, float(seg.end) - start_sec))
-                segments_data.append((rel_start, rel_end, text))
+                rel_start = float(seg.start) - start_sec
+                rel_end = float(seg.end) - start_sec
+                raw_segments.append((rel_start, rel_end, text))
     except ImportError:
         try:
             import whisper  # type: ignore
@@ -314,9 +369,9 @@ def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_se
                 for seg in result.get("segments", []):
                     text = (seg.get("text") or "").strip()
                     if text:
-                        rel_start = max(0.0, float(seg.get("start", 0.0)))
-                        rel_end = min(duration_sec, max(rel_start + 0.4, float(seg.get("end", rel_start + 1.0))))
-                        segments_data.append((rel_start, rel_end, text))
+                        rel_start = float(seg.get("start", 0.0))
+                        rel_end = float(seg.get("end", rel_start + 1.2))
+                        raw_segments.append((rel_start, rel_end, text))
                 cleanup_temp_files(audio_tmp)
         except ImportError:
             return False
@@ -328,16 +383,16 @@ def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_se
         logger.warning(f"faster-whisper transcription failed: {e}")
         return False
 
-    if not segments_data:
+    cues = _normalize_segments(raw_segments, duration_sec)
+    if not cues:
         return False
 
     try:
         with open(srt_path, "w", encoding="utf-8") as f:
-            for idx, (s_sec, e_sec, txt) in enumerate(segments_data, start=1):
-                clean_txt = re.sub(r"\s+", " ", txt).strip()
+            for idx, (s_sec, e_sec, txt) in enumerate(cues, start=1):
                 f.write(f"{idx}\n")
                 f.write(f"{_format_srt_timestamp(s_sec)} --> {_format_srt_timestamp(e_sec)}\n")
-                f.write(f"{clean_txt}\n\n")
+                f.write(f"{txt}\n\n")
         return True
     except Exception as e:
         logger.warning(f"Failed writing SRT file: {e}")
@@ -435,7 +490,7 @@ def health_check():
     return {
         "status": "online",
         "service": "ClipForge AI Backend",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "database": db_status,
         "timestamp_utc": datetime.utcnow().isoformat()
     }
@@ -785,22 +840,28 @@ async def upload_and_clip_endpoint(
 
     try:
         total_duration = get_video_duration_seconds(input_filepath)
-        max_start = max(0.0, total_duration - CLIP_DURATION_SECONDS)
+        clip_len = min(CLIP_DURATION_SECONDS, total_duration) if total_duration > 0 else CLIP_DURATION_SECONDS
+        max_start = max(0.0, total_duration - clip_len)
         start_sec = round(random.uniform(0.0, max_start), 2) if max_start > 0 else 0.0
 
-        has_subs = generate_subtitles_srt(input_filepath, start_sec, CLIP_DURATION_SECONDS, srt_filepath)
+        has_subs = generate_subtitles_srt(input_filepath, start_sec, clip_len, srt_filepath)
 
         # Full-frame 9:16 portrait letterbox with black bars on top/bottom and zero cutting
+        # For a 16:9 (1080x608) video inside 1080x1920, the bottom black bar spans y=1264..1920;
+        # MarginV=260 places bold uppercase captions cleanly along the top edge of the bottom black bar.
         vf_chain = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         if has_subs and os.path.exists(srt_filepath):
             escaped_srt = _escape_ffmpeg_filter_path(srt_filepath)
-            vf_chain += f",subtitles='{escaped_srt}':force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=120'"
+            vf_chain += (
+                f",subtitles='{escaped_srt}':force_style="
+                "'FontName=Arial,FontSize=24,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=260,MarginL=40,MarginR=40'"
+            )
 
         ffmpeg_command = [
             "ffmpeg", "-y", "-threads", "2",
             "-ss", f"{start_sec:.2f}",
             "-i", input_filepath,
-            "-t", f"{int(CLIP_DURATION_SECONDS)}",
+            "-t", f"{clip_len:.2f}",
             "-vf", vf_chain,
             "-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-crf", "24",
             "-movflags", "+faststart",
