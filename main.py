@@ -44,17 +44,14 @@ ALLOWED_VIDEO_MIME_TYPES: Set[str] = {
     "video/x-matroska"
 }
 
-# In-memory active processing lock to prevent duplicate simultaneous submissions per user
 ACTIVE_USER_JOBS: Set[str] = set()
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Initialize Rate Limiter
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ClipForge AI Production Backend",
     description="Automated video clipping, JWT authentication, rate limiting, and compliance backend engine.",
-    version="3.2.1",
+    version="3.3.0",
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None
 )
@@ -81,7 +78,6 @@ app.add_middleware(
 
 @app.middleware("http")
 async def add_security_and_timing_headers(request: Request, call_next):
-    """Adds security headers, measures request latency, and logs suspicious 4xx/5xx patterns."""
     start_time = time.time()
     try:
         response = await call_next(request)
@@ -121,7 +117,6 @@ async def add_security_and_timing_headers(request: Request, call_next):
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_db_connection() -> psycopg2.extensions.connection:
-    """Establishes and returns a live connection to PostgreSQL with connection timeout."""
     if not DATABASE_URL:
         logger.critical("DATABASE_URL environment variable is missing.")
         raise HTTPException(
@@ -144,7 +139,6 @@ def get_db_connection() -> psycopg2.extensions.connection:
 
 @app.on_event("startup")
 def startup_db_initialization() -> None:
-    """Creates tables, applies schema migrations, and creates performance indexes on startup."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -161,13 +155,11 @@ def startup_db_initialization() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Safe column additions for existing tables
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS id SERIAL UNIQUE;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS age_verified BOOLEAN DEFAULT FALSE;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_scheduled_at TIMESTAMP DEFAULT NULL;")
 
-        # Recent renders history table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS renders (
                 id SERIAL PRIMARY KEY,
@@ -178,7 +170,6 @@ def startup_db_initialization() -> None:
             );
         """)
 
-        # Database performance indexes
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_deletion_scheduled ON users (deletion_scheduled_at) WHERE deletion_scheduled_at IS NOT NULL;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_renders_user_created ON renders (user_id, created_at DESC);")
@@ -214,27 +205,23 @@ class TokenResponseSchema(BaseModel):
 
 
 # ==========================================
-# 5. CRYPTOGRAPHY, CLEANUP & AUTH HELPERS
+# 5. CRYPTOGRAPHY, CLEANUP & SUBTITLE HELPERS
 # ==========================================
 def verify_password(plain_password: str, hashed_password: Optional[str]) -> bool:
-    """Verifies a plaintext password against its bcrypt hash."""
     if not hashed_password:
         return False
     return pwd_context.verify(plain_password, hashed_password)
 
 def get_password_hash(password: str) -> str:
-    """Generates a secure bcrypt password hash."""
     return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Encodes a signed JWT access token containing user claims."""
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def cleanup_temp_files(*filepaths: str) -> None:
-    """Background task helper to remove temporary video files after streaming response."""
     for path in filepaths:
         if path and os.path.exists(path):
             try:
@@ -243,7 +230,6 @@ def cleanup_temp_files(*filepaths: str) -> None:
                 logger.warning(f"Temp file cleanup warning for {path}: {e}")
 
 def get_video_duration_seconds(filepath: str) -> float:
-    """Gets video duration in seconds using ffprobe; falls back to default clip length."""
     try:
         res = subprocess.run(
             [
@@ -266,7 +252,7 @@ def get_video_duration_seconds(filepath: str) -> float:
     return CLIP_DURATION_SECONDS
 
 def _clean_subtitle_text(raw_text: str) -> str:
-    """Removes em/en/hyphen dashes, strips whitespace, and formats clean uppercase caption text."""
+    """Strips em/en/hyphen dashes, collapses whitespace, and formats clean uppercase caption text."""
     text = raw_text or ""
     text = text.replace("\u2014", " ").replace("\u2013", " ")
     text = re.sub(r"(^|\s)[-–—]+(\s|$)", " ", text)
@@ -274,50 +260,35 @@ def _clean_subtitle_text(raw_text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text.upper()
 
-def _normalize_segments(raw_segments: List[Tuple[float, float, str]], duration_sec: float) -> List[Tuple[float, float, str]]:
-    """Smooths short or quick-flashing subtitle segments so each caption stays readable on screen."""
-    cleaned: List[Tuple[float, float, str]] = []
-    for s_sec, e_sec, txt in raw_segments:
-        norm_txt = _clean_subtitle_text(txt)
-        if not norm_txt:
-            continue
-        start_c = max(0.0, min(duration_sec - 0.5, float(s_sec)))
-        end_c = max(start_c + 1.2, min(duration_sec, float(e_sec)))
-        if end_c - start_c < 1.2:
-            end_c = min(duration_sec, start_c + 1.2)
-        cleaned.append((start_c, end_c, norm_txt))
-
-    if not cleaned:
+def _split_caption_chunks(words: List[str], start_sec: float, end_sec: float) -> List[Tuple[float, float, str]]:
+    """Splits a multi-word transcription chunk into balanced 4-6 word subtitle lines that stay readable."""
+    if not words:
         return []
+    total_dur = max(1.2, end_sec - start_sec)
+    if len(words) <= 6:
+        return [(start_sec, end_sec, " ".join(words))]
 
-    merged: List[Tuple[float, float, str]] = []
-    for s_sec, e_sec, txt in cleaned:
-        if merged:
-            prev_s, prev_e, prev_txt = merged[-1]
-            gap = s_sec - prev_e
-            combined_words = len((prev_txt + " " + txt).split())
-            if gap <= 0.45 and (len(prev_txt.split()) <= 3 or len(txt.split()) <= 2) and combined_words <= 7:
-                new_e = max(prev_e, e_sec)
-                if new_e - prev_s < 1.2:
-                    new_e = min(duration_sec, prev_s + 1.2)
-                merged[-1] = (prev_s, new_e, f"{prev_txt} {txt}")
-                continue
-        merged.append((s_sec, e_sec, txt))
+    # Split into groups of up to 5 words
+    groups: List[List[str]] = []
+    for i in range(0, len(words), 5):
+        groups.append(words[i:i + 5])
+    # Avoid orphan 1-2 word tail by merging with previous group
+    if len(groups) > 1 and len(groups[-1]) <= 2:
+        groups[-2].extend(groups[-1])
+        groups.pop()
 
-    final_cues: List[Tuple[float, float, str]] = []
-    for idx, (s_sec, e_sec, txt) in enumerate(merged):
-        adjusted_s = s_sec
-        if final_cues and adjusted_s < final_cues[-1][1] + 0.05:
-            adjusted_s = min(duration_sec - 0.8, final_cues[-1][1] + 0.05)
-        adjusted_e = max(adjusted_s + 1.2, min(duration_sec, e_sec))
-        if idx + 1 < len(merged) and adjusted_e > merged[idx + 1][0] - 0.05:
-            adjusted_e = max(adjusted_s + 0.9, merged[idx + 1][0] - 0.05)
-        final_cues.append((adjusted_s, adjusted_e, txt))
-
-    return final_cues
+    total_words = sum(len(g) for g in groups)
+    cues: List[Tuple[float, float, str]] = []
+    cursor = start_sec
+    for idx, grp in enumerate(groups):
+        share = (len(grp) / total_words) * total_dur
+        seg_end = end_sec if idx == len(groups) - 1 else min(end_sec, cursor + max(1.1, share))
+        if seg_end > cursor + 0.3:
+            cues.append((cursor, seg_end, " ".join(grp)))
+        cursor = seg_end
+    return cues
 
 def _format_srt_timestamp(seconds: float) -> str:
-    """Formats seconds into SRT timestamp HH:MM:SS,mmm."""
     clamped = max(0.0, seconds)
     hours = int(clamped // 3600)
     minutes = int((clamped % 3600) // 60)
@@ -329,59 +300,56 @@ def _format_srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_sec: float, srt_path: str) -> bool:
-    """Transcribes the clipped segment using faster-whisper (or whisper) and writes a clean SRT file."""
-    raw_segments: List[Tuple[float, float, str]] = []
-    audio_tmp = f"{srt_path}_seg.wav"
-
-    extract_res = subprocess.run(
-        [
-            "ffmpeg", "-y", "-ss", f"{start_sec:.2f}", "-t", f"{duration_sec:.2f}",
-            "-i", source_video_path, "-vn", "-ac", "1", "-ar", "16000", audio_tmp
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    if extract_res.returncode != 0 or not os.path.exists(audio_tmp):
-        logger.warning("Subtitle audio extraction failed or video has no audio track.")
-        cleanup_temp_files(audio_tmp)
-        return False
-
+    """
+    Transcribes the clipped segment in 5-second windows using SpeechRecognition (zero heavy ML deps)
+    and writes clean, readable SRT subtitles with no em-dashes or split-second flashes.
+    """
     try:
-        try:
-            from faster_whisper import WhisperModel  # type: ignore
-            model = WhisperModel("tiny", device="cpu", compute_type="int8")
-            segments_iter, _ = model.transcribe(audio_tmp, vad_filter=True)
-            for seg in segments_iter:
-                text = (seg.text or "").strip()
-                if text:
-                    raw_segments.append((float(seg.start), float(seg.end), text))
-        except ImportError:
-            import whisper  # type: ignore
-            model = whisper.load_model("tiny", device="cpu")
-            result = model.transcribe(audio_tmp, fp16=False)
-            for seg in result.get("segments", []):
-                text = (seg.get("text") or "").strip()
-                if text:
-                    raw_segments.append((
-                        float(seg.get("start", 0.0)),
-                        float(seg.get("end", float(seg.get("start", 0.0)) + 1.2)),
-                        text
-                    ))
+        import speech_recognition as sr  # type: ignore
     except ImportError:
-        logger.warning("No Whisper package installed; skipping subtitles.")
-        cleanup_temp_files(audio_tmp)
-        return False
-    except Exception as e:
-        logger.warning(f"Whisper transcription error: {e}")
-        cleanup_temp_files(audio_tmp)
+        logger.warning("SpeechRecognition package not installed; skipping subtitles.")
         return False
 
-    cleanup_temp_files(audio_tmp)
+    recognizer = sr.Recognizer()
+    cues: List[Tuple[float, float, str]] = []
+    step_sec = 5.0
+    offset = 0.0
 
-    cues = _normalize_segments(raw_segments, duration_sec)
+    while offset < duration_sec - 0.3:
+        chunk_len = min(step_sec, duration_sec - offset)
+        chunk_wav = f"{srt_path}_{int(offset * 10)}.wav"
+        res = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", f"{start_sec + offset:.2f}",
+                "-t", f"{chunk_len:.2f}",
+                "-i", source_video_path,
+                "-vn", "-ac", "1", "-ar", "16000", chunk_wav
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if res.returncode == 0 and os.path.exists(chunk_wav):
+            try:
+                with sr.AudioFile(chunk_wav) as source:
+                    audio_data = recognizer.record(source)
+                raw_text = recognizer.recognize_google(audio_data)
+                cleaned = _clean_subtitle_text(raw_text)
+                if cleaned:
+                    words = cleaned.split()
+                    sub_cues = _split_caption_chunks(words, offset, offset + chunk_len)
+                    cues.extend(sub_cues)
+            except sr.UnknownValueError:
+                pass
+            except Exception as e:
+                logger.warning(f"Speech recognition chunk error at {offset}s: {e}")
+            finally:
+                cleanup_temp_files(chunk_wav)
+        offset += step_sec
+
     if not cues:
-        logger.info("No speech segments detected in selected clip window.")
+        logger.info("No speech transcribed for clip segment.")
         return False
 
     try:
@@ -396,13 +364,11 @@ def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_se
         return False
 
 def _escape_ffmpeg_filter_path(path: str) -> str:
-    """Escapes a file path for FFmpeg subtitles filter syntax."""
     normalized = path.replace("\\", "/")
     normalized = normalized.replace(":", "\\:").replace("'", "\\'")
     return normalized
 
 def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
-    """Dependency validator that decodes JWT tokens and enforces account deletion status."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -473,7 +439,6 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, A
 @app.api_route("/", methods=["GET", "HEAD"], tags=["Health"])
 @app.get("/health", tags=["Health"])
 def health_check():
-    """Uptime monitoring endpoint verifying API and database responsiveness."""
     db_status = "connected"
     try:
         conn = get_db_connection()
@@ -487,7 +452,7 @@ def health_check():
     return {
         "status": "online",
         "service": "ClipForge AI Backend",
-        "version": "3.2.1",
+        "version": "3.3.0",
         "database": db_status,
         "timestamp_utc": datetime.utcnow().isoformat()
     }
@@ -496,7 +461,6 @@ def health_check():
 @app.post("/auth/register-login", response_model=TokenResponseSchema, tags=["Authentication"])
 @limiter.limit("10/minute")
 def register_or_login_email_endpoint(request: Request, data: EmailRegisterLoginSchema):
-    """Handles secure user registration and login via email and password with rate limiting."""
     normalized_email = data.email.strip().lower()
     conn = get_db_connection()
     cur = conn.cursor()
@@ -575,7 +539,6 @@ def register_or_login_email_endpoint(request: Request, data: EmailRegisterLoginS
 @app.post("/api/auth/google", response_model=TokenResponseSchema, tags=["Authentication"])
 @limiter.limit("15/minute")
 def google_auth_endpoint(request: Request, data: GoogleAuthSchema):
-    """Verifies Google ID tokens with timeout protection and provisions or authenticates users."""
     try:
         google_response = requests.get(
             f"https://oauth2.googleapis.com/tokeninfo?id_token={data.token}",
@@ -670,7 +633,6 @@ def google_auth_endpoint(request: Request, data: GoogleAuthSchema):
 @app.post("/api/account/schedule-deletion", tags=["Account Lifecycle"])
 @limiter.limit("5/minute")
 def schedule_account_deletion_endpoint(request: Request, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Schedules account deletion 30 days from now."""
     deletion_time = datetime.utcnow() + timedelta(days=30)
     formatted_dt = deletion_time.strftime("%B %d, %Y at %H:%M UTC")
 
@@ -697,7 +659,6 @@ def schedule_account_deletion_endpoint(request: Request, current_user: Dict[str,
 
 @app.get("/api/renders", tags=["Video Processing"])
 def list_user_renders_endpoint(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Returns metadata for the current user's recent vertical renders (without spending credits)."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -732,7 +693,6 @@ def stream_saved_render_endpoint(
     download: bool = False,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Streams a previously rendered vertical clip for preview or download without deducting credits."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -771,17 +731,14 @@ async def upload_and_clip_endpoint(
     file: UploadFile = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """Secure video clipping endpoint with MIME validation, duplicate job lock, size cap, and FFmpeg compression."""
     user_email = current_user["email"]
 
-    # Prevent duplicate simultaneous requests from the same account
     if user_email in ACTIVE_USER_JOBS:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="A video is already processing on your account. Please wait for it to finish."
         )
 
-    # Validate MIME type
     if file.content_type not in ALLOWED_VIDEO_MIME_TYPES:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
@@ -843,7 +800,8 @@ async def upload_and_clip_endpoint(
 
         has_subs = generate_subtitles_srt(input_filepath, start_sec, clip_len, srt_filepath)
 
-        # Full-frame 9:16 portrait letterbox with black bars on top/bottom and zero cutting
+        # Full-frame 9:16 portrait letterbox with black bars on top/bottom and zero cutting.
+        # Subtitles are placed at MarginV=260 (along the top edge of the bottom black bar) matching the 45s reference clip.
         vf_chain = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         if has_subs and os.path.exists(srt_filepath):
             escaped_srt = _escape_ffmpeg_filter_path(srt_filepath)
