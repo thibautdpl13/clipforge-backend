@@ -51,7 +51,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ClipForge AI Production Backend",
     description="Automated video clipping, JWT authentication, rate limiting, and compliance backend engine.",
-    version="3.3.0",
+    version="3.4.0",
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None
 )
@@ -260,32 +260,33 @@ def _clean_subtitle_text(raw_text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text.upper()
 
-def _split_caption_chunks(words: List[str], start_sec: float, end_sec: float) -> List[Tuple[float, float, str]]:
-    """Splits a multi-word transcription chunk into balanced 4-6 word subtitle lines that stay readable."""
+def _build_window_cues(words: List[str], window_start: float, window_end: float) -> List[Tuple[float, float, str]]:
+    """
+    Splits recognized words into short 3-5 word phrases timed to natural speaking pace
+    instead of stretching single words across an entire silent/long window.
+    """
     if not words:
         return []
-    total_dur = max(1.2, end_sec - start_sec)
-    if len(words) <= 6:
-        return [(start_sec, end_sec, " ".join(words))]
 
-    # Split into groups of up to 5 words
     groups: List[List[str]] = []
-    for i in range(0, len(words), 5):
-        groups.append(words[i:i + 5])
-    # Avoid orphan 1-2 word tail by merging with previous group
-    if len(groups) > 1 and len(groups[-1]) <= 2:
+    for i in range(0, len(words), 4):
+        groups.append(words[i:i + 4])
+    if len(groups) > 1 and len(groups[-1]) == 1:
         groups[-2].extend(groups[-1])
         groups.pop()
 
-    total_words = sum(len(g) for g in groups)
     cues: List[Tuple[float, float, str]] = []
-    cursor = start_sec
-    for idx, grp in enumerate(groups):
-        share = (len(grp) / total_words) * total_dur
-        seg_end = end_sec if idx == len(groups) - 1 else min(end_sec, cursor + max(1.1, share))
-        if seg_end > cursor + 0.3:
-            cues.append((cursor, seg_end, " ".join(grp)))
-        cursor = seg_end
+    cursor = window_start
+    for grp in groups:
+        # ~0.35s per word, minimum 1.1s, maximum 2.4s, never exceeding window_end
+        spoken_dur = max(1.1, min(2.4, len(grp) * 0.36))
+        if cursor >= window_end - 0.3:
+            break
+        cue_end = min(window_end, cursor + spoken_dur)
+        if cue_end - cursor >= 0.7:
+            cues.append((cursor, cue_end, " ".join(grp)))
+        cursor = cue_end + 0.08
+
     return cues
 
 def _format_srt_timestamp(seconds: float) -> str:
@@ -301,8 +302,7 @@ def _format_srt_timestamp(seconds: float) -> str:
 
 def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_sec: float, srt_path: str) -> bool:
     """
-    Transcribes the clipped segment in 5-second windows using SpeechRecognition (zero heavy ML deps)
-    and writes clean, readable SRT subtitles with no em-dashes or split-second flashes.
+    Transcribes the clipped segment in 2.5-second windows and writes clean, naturally timed SRT cues.
     """
     try:
         import speech_recognition as sr  # type: ignore
@@ -312,10 +312,10 @@ def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_se
 
     recognizer = sr.Recognizer()
     cues: List[Tuple[float, float, str]] = []
-    step_sec = 5.0
+    step_sec = 2.5
     offset = 0.0
 
-    while offset < duration_sec - 0.3:
+    while offset < duration_sec - 0.25:
         chunk_len = min(step_sec, duration_sec - offset)
         chunk_wav = f"{srt_path}_{int(offset * 10)}.wav"
         res = subprocess.run(
@@ -337,9 +337,7 @@ def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_se
                 raw_text = recognizer.recognize_google(audio_data)
                 cleaned = _clean_subtitle_text(raw_text)
                 if cleaned:
-                    words = cleaned.split()
-                    sub_cues = _split_caption_chunks(words, offset, offset + chunk_len)
-                    cues.extend(sub_cues)
+                    cues.extend(_build_window_cues(cleaned.split(), offset, offset + chunk_len))
             except sr.UnknownValueError:
                 pass
             except Exception as e:
@@ -452,7 +450,7 @@ def health_check():
     return {
         "status": "online",
         "service": "ClipForge AI Backend",
-        "version": "3.3.0",
+        "version": "3.4.0",
         "database": db_status,
         "timestamp_utc": datetime.utcnow().isoformat()
     }
@@ -801,13 +799,14 @@ async def upload_and_clip_endpoint(
         has_subs = generate_subtitles_srt(input_filepath, start_sec, clip_len, srt_filepath)
 
         # Full-frame 9:16 portrait letterbox with black bars on top/bottom and zero cutting.
-        # Subtitles are placed at MarginV=260 (along the top edge of the bottom black bar) matching the 45s reference clip.
+        # PlayResX=1080, PlayResY=1920 + Alignment=2 + MarginV=610 places bold captions
+        # cleanly at the top of the bottom black bar (which begins at y=1264 on a 1920px canvas).
         vf_chain = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         if has_subs and os.path.exists(srt_filepath):
             escaped_srt = _escape_ffmpeg_filter_path(srt_filepath)
             vf_chain += (
                 f",subtitles='{escaped_srt}':force_style="
-                "'FontName=Arial,FontSize=24,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=260,MarginL=40,MarginR=40'"
+                "'PlayResX=1080,PlayResY=1920,FontName=Arial,FontSize=54,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=4,Shadow=0,Alignment=2,MarginV=610,MarginL=50,MarginR=50'"
             )
 
         ffmpeg_command = [
