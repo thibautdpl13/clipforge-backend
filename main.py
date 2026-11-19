@@ -1,11 +1,13 @@
 import os
 import io
+import re
 import time
 import base64
+import random
 import logging
 import subprocess
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any, Set, List
 from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Depends, status, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
@@ -33,6 +35,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7       # 7 days valid access token
 MAX_FILE_SIZE_BYTES = 250 * 1024 * 1024          # Strict 250MB upload cap
 MAX_STORED_RENDER_BYTES = 10 * 1024 * 1024       # Cap DB history blob size at 10MB to protect RAM
+CLIP_DURATION_SECONDS = 30.0
 ALLOWED_VIDEO_MIME_TYPES: Set[str] = {
     "video/mp4",
     "video/quicktime",
@@ -51,7 +54,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ClipForge AI Production Backend",
     description="Automated video clipping, JWT authentication, rate limiting, and compliance backend engine.",
-    version="3.0.0",
+    version="3.1.0",
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None
 )
@@ -239,6 +242,113 @@ def cleanup_temp_files(*filepaths: str) -> None:
             except Exception as e:
                 logger.warning(f"Temp file cleanup warning for {path}: {e}")
 
+def get_video_duration_seconds(filepath: str) -> float:
+    """Gets video duration in seconds using ffprobe; falls back to 30.0s if unavailable."""
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            dur = float(res.stdout.strip())
+            if dur > 0:
+                return dur
+    except Exception as e:
+        logger.warning(f"ffprobe duration lookup fallback: {e}")
+    return CLIP_DURATION_SECONDS
+
+def _format_srt_timestamp(seconds: float) -> str:
+    """Formats seconds into SRT timestamp HH:MM:SS,mmm."""
+    clamped = max(0.0, seconds)
+    hours = int(clamped // 3600)
+    minutes = int((clamped % 3600) // 60)
+    secs = int(clamped % 60)
+    millis = int(round((clamped - int(clamped)) * 1000))
+    if millis == 1000:
+        secs += 1
+        millis = 0
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_sec: float, srt_path: str) -> bool:
+    """Transcribes the clipped segment if faster-whisper or whisper is installed and writes an SRT file."""
+    segments_data: List[tuple] = []
+
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+        model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        raw_segments, _ = model.transcribe(
+            source_video_path,
+            clip_timestamps=[start_sec, start_sec + duration_sec],
+            vad_filter=True
+        )
+        for seg in raw_segments:
+            text = (seg.text or "").strip()
+            if text:
+                rel_start = max(0.0, float(seg.start) - start_sec)
+                rel_end = min(duration_sec, max(rel_start + 0.4, float(seg.end) - start_sec))
+                segments_data.append((rel_start, rel_end, text))
+    except ImportError:
+        try:
+            import whisper  # type: ignore
+            audio_tmp = f"{srt_path}_seg.wav"
+            extract_res = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-ss", f"{start_sec:.2f}", "-t", f"{duration_sec:.2f}",
+                    "-i", source_video_path, "-vn", "-ac", "1", "-ar", "16000", audio_tmp
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if extract_res.returncode == 0 and os.path.exists(audio_tmp):
+                model = whisper.load_model("tiny", device="cpu")
+                result = model.transcribe(audio_tmp, fp16=False)
+                for seg in result.get("segments", []):
+                    text = (seg.get("text") or "").strip()
+                    if text:
+                        rel_start = max(0.0, float(seg.get("start", 0.0)))
+                        rel_end = min(duration_sec, max(rel_start + 0.4, float(seg.get("end", rel_start + 1.0))))
+                        segments_data.append((rel_start, rel_end, text))
+                cleanup_temp_files(audio_tmp)
+        except ImportError:
+            return False
+        except Exception as e:
+            logger.warning(f"Whisper transcription failed: {e}")
+            cleanup_temp_files(f"{srt_path}_seg.wav")
+            return False
+    except Exception as e:
+        logger.warning(f"faster-whisper transcription failed: {e}")
+        return False
+
+    if not segments_data:
+        return False
+
+    try:
+        with open(srt_path, "w", encoding="utf-8") as f:
+            for idx, (s_sec, e_sec, txt) in enumerate(segments_data, start=1):
+                clean_txt = re.sub(r"\s+", " ", txt).strip()
+                f.write(f"{idx}\n")
+                f.write(f"{_format_srt_timestamp(s_sec)} --> {_format_srt_timestamp(e_sec)}\n")
+                f.write(f"{clean_txt}\n\n")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed writing SRT file: {e}")
+        return False
+
+def _escape_ffmpeg_filter_path(path: str) -> str:
+    """Escapes a file path for FFmpeg subtitles filter syntax."""
+    normalized = path.replace("\\", "/")
+    normalized = normalized.replace(":", "\\:").replace("'", "\\'")
+    return normalized
+
 def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
     """Dependency validator that decodes JWT tokens and enforces account deletion status."""
     if not authorization or not authorization.startswith("Bearer "):
@@ -325,7 +435,7 @@ def health_check():
     return {
         "status": "online",
         "service": "ClipForge AI Backend",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "database": db_status,
         "timestamp_utc": datetime.utcnow().isoformat()
     }
@@ -636,6 +746,7 @@ async def upload_and_clip_endpoint(
     job_identifier = os.urandom(6).hex()
     input_filepath = f"input_{job_identifier}.mp4"
     output_filepath = f"output_{job_identifier}.mp4"
+    srt_filepath = f"subs_{job_identifier}.srt"
 
     written_bytes = 0
     try:
@@ -647,7 +758,7 @@ async def upload_and_clip_endpoint(
                 written_bytes += len(chunk)
                 if written_bytes > MAX_FILE_SIZE_BYTES:
                     buffer_file.close()
-                    cleanup_temp_files(input_filepath)
+                    cleanup_temp_files(input_filepath, srt_filepath)
                     raise HTTPException(
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail="Uploaded file exceeds the maximum permitted size limit of 250MB."
@@ -657,7 +768,7 @@ async def upload_and_clip_endpoint(
         ACTIVE_USER_JOBS.discard(user_email)
         raise
     except Exception:
-        cleanup_temp_files(input_filepath)
+        cleanup_temp_files(input_filepath, srt_filepath)
         ACTIVE_USER_JOBS.discard(user_email)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -665,7 +776,7 @@ async def upload_and_clip_endpoint(
         )
 
     if written_bytes == 0:
-        cleanup_temp_files(input_filepath)
+        cleanup_temp_files(input_filepath, srt_filepath)
         ACTIVE_USER_JOBS.discard(user_email)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -673,11 +784,24 @@ async def upload_and_clip_endpoint(
         )
 
     try:
-        # Optimized FFmpeg vertical crop and H.264 web compression with veryfast preset
+        total_duration = get_video_duration_seconds(input_filepath)
+        max_start = max(0.0, total_duration - CLIP_DURATION_SECONDS)
+        start_sec = round(random.uniform(0.0, max_start), 2) if max_start > 0 else 0.0
+
+        has_subs = generate_subtitles_srt(input_filepath, start_sec, CLIP_DURATION_SECONDS, srt_filepath)
+
+        # Full-frame 9:16 portrait letterbox with black bars on top/bottom and zero cutting
+        vf_chain = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+        if has_subs and os.path.exists(srt_filepath):
+            escaped_srt = _escape_ffmpeg_filter_path(srt_filepath)
+            vf_chain += f",subtitles='{escaped_srt}':force_style='FontName=Arial,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=2,MarginV=120'"
+
         ffmpeg_command = [
-            "ffmpeg", "-y", "-threads", "2", "-i", input_filepath,
-            "-ss", "00:00:00", "-to", "00:00:30",
-            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+            "ffmpeg", "-y", "-threads", "2",
+            "-ss", f"{start_sec:.2f}",
+            "-i", input_filepath,
+            "-t", f"{int(CLIP_DURATION_SECONDS)}",
+            "-vf", vf_chain,
             "-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-crf", "24",
             "-movflags", "+faststart",
             "-c:a", "aac", "-b:a", "128k", output_filepath
@@ -736,7 +860,7 @@ async def upload_and_clip_endpoint(
             conn.close()
 
         del encoded_video
-        background_tasks.add_task(cleanup_temp_files, input_filepath, output_filepath)
+        background_tasks.add_task(cleanup_temp_files, input_filepath, output_filepath, srt_filepath)
 
         return FileResponse(
             output_filepath,
@@ -745,7 +869,7 @@ async def upload_and_clip_endpoint(
         )
 
     except Exception as err:
-        cleanup_temp_files(input_filepath, output_filepath)
+        cleanup_temp_files(input_filepath, output_filepath, srt_filepath)
         if isinstance(err, HTTPException):
             raise err
         logger.error(f"Unexpected error clipping video for {user_email}: {str(err)}")
