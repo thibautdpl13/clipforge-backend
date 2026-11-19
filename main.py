@@ -673,12 +673,12 @@ async def upload_and_clip_endpoint(
         )
 
     try:
-        # Optimized FFmpeg vertical crop and H.264 web compression
+        # Optimized FFmpeg vertical crop and H.264 web compression with veryfast preset
         ffmpeg_command = [
             "ffmpeg", "-y", "-threads", "2", "-i", input_filepath,
             "-ss", "00:00:00", "-to", "00:00:30",
             "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-            "-c:v", "libx264", "-threads", "2", "-preset", "fast", "-crf", "24",
+            "-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-crf", "24",
             "-movflags", "+faststart",
             "-c:a", "aac", "-b:a", "128k", output_filepath
         ]
@@ -687,8 +687,7 @@ async def upload_and_clip_endpoint(
             ffmpeg_command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            timeout=120
+            text=True
         )
 
         if process_result.returncode != 0:
@@ -745,12 +744,6 @@ async def upload_and_clip_endpoint(
             filename="clipforge_vertical_highlight.mp4"
         )
 
-    except subprocess.TimeoutExpired:
-        cleanup_temp_files(input_filepath, output_filepath)
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Video processing timed out. Try uploading a shorter clip."
-        )
     except Exception as err:
         cleanup_temp_files(input_filepath, output_filepath)
         if isinstance(err, HTTPException):
