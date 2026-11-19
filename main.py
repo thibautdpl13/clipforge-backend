@@ -51,7 +51,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="ClipForge AI Production Backend",
     description="Automated video clipping, JWT authentication, rate limiting, and compliance backend engine.",
-    version="3.6.0",
+    version="3.7.0",
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None
 )
@@ -260,63 +260,95 @@ def _clean_subtitle_text(raw_text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text.upper()
 
-def _build_window_cues(words: List[str], window_start: float, window_end: float) -> List[Tuple[float, float, str]]:
+def _detect_speech_segments(audio_path: str, duration_sec: float) -> List[Tuple[float, float]]:
     """
-    Splits words into crisp 3-4 word subtitle phrases with natural duration
-    (~0.38s per word, 0.9s to 1.5s) inside the active window.
+    Uses ffmpeg silencedetect to find active speech intervals (start, end)
+    relative to the clipped audio segment.
+    """
+    res = subprocess.run(
+        [
+            "ffmpeg", "-i", audio_path,
+            "-af", "silencedetect=noise=-28dB:d=0.35",
+            "-f", "null", "-"
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    stderr_out = res.stderr or ""
+    silence_starts: List[float] = []
+    silence_ends: List[float] = []
+
+    for line in stderr_out.splitlines():
+        m_start = re.search(r"silence_start:\s*([0-9.]+)", line)
+        if m_start:
+            silence_starts.append(float(m_start.group(1)))
+        m_end = re.search(r"silence_end:\s*([0-9.]+)", line)
+        if m_end:
+            silence_ends.append(float(m_end.group(1)))
+
+    # Pair silence intervals into non-silent speech intervals
+    speech_intervals: List[Tuple[float, float]] = []
+    cursor = 0.0
+    for idx, s_start in enumerate(silence_starts):
+        if s_start > cursor + 0.35:
+            speech_intervals.append((cursor, min(duration_sec, s_start)))
+        if idx < len(silence_ends):
+            cursor = max(cursor, silence_ends[idx])
+        else:
+            cursor = duration_sec
+
+    if cursor < duration_sec - 0.35:
+        speech_intervals.append((cursor, duration_sec))
+
+    # Split long speech stretches (> 4.5s) into ~3.5s chunks so subtitles keep pace with speech
+    chunks: List[Tuple[float, float]] = []
+    for sp_start, sp_end in speech_intervals:
+        seg_len = sp_end - sp_start
+        if seg_len <= 4.5:
+            chunks.append((sp_start, sp_end))
+        else:
+            sub_cursor = sp_start
+            while sub_cursor < sp_end - 0.35:
+                next_end = min(sp_end, sub_cursor + 3.5)
+                if next_end - sub_cursor >= 0.4:
+                    chunks.append((sub_cursor, next_end))
+                sub_cursor = next_end
+
+    return chunks
+
+def _distribute_words_over_span(words: List[str], span_start: float, span_end: float) -> List[Tuple[float, float, str]]:
+    """
+    Splits words into 3-5 word blocks and spans each block across the exact
+    duration that those words are spoken within [span_start, span_end].
     """
     if not words:
         return []
+    span_dur = max(0.6, span_end - span_start)
+    if len(words) <= 5:
+        return [(span_start, span_end, " ".join(words))]
 
-    groups: List[List[str]] = []
+    blocks: List[List[str]] = []
     for i in range(0, len(words), 4):
-        groups.append(words[i:i + 4])
-    if len(groups) > 1 and len(groups[-1]) == 1:
-        groups[-2].extend(groups[-1])
-        groups.pop()
+        blocks.append(words[i:i + 4])
+    if len(blocks) > 1 and len(blocks[-1]) == 1:
+        blocks[-2].extend(blocks[-1])
+        blocks.pop()
 
+    total_words = sum(len(b) for b in blocks)
     cues: List[Tuple[float, float, str]] = []
-    cursor = window_start
-    for grp in groups:
-        if cursor >= window_end - 0.2:
-            break
-        spoken_dur = max(0.9, min(1.5, len(grp) * 0.38))
-        cue_end = min(window_end, cursor + spoken_dur)
-        if cue_end - cursor >= 0.6:
-            cues.append((cursor, cue_end, " ".join(grp)))
-        cursor = cue_end + 0.04
+    cursor = span_start
+    for idx, blk in enumerate(blocks):
+        if idx == len(blocks) - 1:
+            end_t = span_end
+        else:
+            portion = (len(blk) / total_words) * span_dur
+            end_t = min(span_end, cursor + max(0.55, portion))
+        if end_t > cursor + 0.25:
+            cues.append((cursor, end_t, " ".join(blk)))
+        cursor = end_t
 
     return cues
-
-def _dedupe_and_merge_cues(cues: List[Tuple[float, float, str]], duration_sec: float) -> List[Tuple[float, float, str]]:
-    """Removes duplicate/overlapping phrases from overlapping audio windows and keeps clean ordering."""
-    accepted: List[Tuple[float, float, str]] = []
-    recent_texts: List[str] = []
-
-    for s_sec, e_sec, txt in cues:
-        norm_words = set(txt.split())
-        is_dup = False
-        for prev_txt in recent_texts[-3:]:
-            prev_words = set(prev_txt.split())
-            if norm_words and prev_words:
-                overlap_ratio = len(norm_words & prev_words) / max(1, len(norm_words))
-                if overlap_ratio >= 0.75:
-                    is_dup = True
-                    break
-        if is_dup:
-            continue
-
-        start_c = max(0.0, min(duration_sec - 0.6, s_sec))
-        if accepted and start_c < accepted[-1][1] + 0.03:
-            start_c = min(duration_sec - 0.6, accepted[-1][1] + 0.03)
-        end_c = max(start_c + 0.85, min(duration_sec, e_sec))
-        if accepted and end_c <= accepted[-1][1]:
-            continue
-
-        accepted.append((start_c, end_c, txt))
-        recent_texts.append(txt)
-
-    return accepted
 
 def _format_srt_timestamp(seconds: float) -> str:
     clamped = max(0.0, seconds)
@@ -331,8 +363,8 @@ def _format_srt_timestamp(seconds: float) -> str:
 
 def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_sec: float, srt_path: str) -> bool:
     """
-    Transcribes the clipped segment using overlapping 3.0s windows (2.6s step)
-    for high caption density across the clip without dashes or split-second flashes.
+    Extracts the clipped segment audio, detects spoken intervals, transcribes each spoken
+    interval, and times each subtitle block to the exact duration of the speech it represents.
     """
     try:
         import speech_recognition as sr  # type: ignore
@@ -340,47 +372,67 @@ def generate_subtitles_srt(source_video_path: str, start_sec: float, duration_se
         logger.warning("SpeechRecognition package not installed; skipping subtitles.")
         return False
 
+    full_seg_wav = f"{srt_path}_full.wav"
+    extract_res = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-ss", f"{start_sec:.2f}",
+            "-t", f"{duration_sec:.2f}",
+            "-i", source_video_path,
+            "-vn", "-ac", "1", "-ar", "16000", full_seg_wav
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    if extract_res.returncode != 0 or not os.path.exists(full_seg_wav):
+        cleanup_temp_files(full_seg_wav)
+        return False
+
+    speech_spans = _detect_speech_segments(full_seg_wav, duration_sec)
+    if not speech_spans:
+        speech_spans = [(0.0, duration_sec)]
+
     recognizer = sr.Recognizer()
     recognizer.dynamic_energy_threshold = False
-    recognizer.energy_threshold = 120
+    recognizer.energy_threshold = 180
 
-    raw_cues: List[Tuple[float, float, str]] = []
-    window_len = 3.0
-    step_sec = 2.6
-    offset = 0.0
+    cues: List[Tuple[float, float, str]] = []
 
-    while offset < duration_sec - 0.25:
-        actual_len = min(window_len, duration_sec - offset)
-        chunk_wav = f"{srt_path}_{int(offset * 100)}.wav"
-        res = subprocess.run(
+    for sp_start, sp_end in speech_spans:
+        sp_dur = sp_end - sp_start
+        if sp_dur < 0.4:
+            continue
+        span_wav = f"{srt_path}_{int(sp_start * 100)}_{int(sp_end * 100)}.wav"
+        cut_res = subprocess.run(
             [
                 "ffmpeg", "-y",
-                "-ss", f"{start_sec + offset:.2f}",
-                "-t", f"{actual_len:.2f}",
-                "-i", source_video_path,
-                "-vn", "-ac", "1", "-ar", "16000", chunk_wav
+                "-ss", f"{sp_start:.2f}",
+                "-t", f"{sp_dur:.2f}",
+                "-i", full_seg_wav,
+                "-ac", "1", "-ar", "16000", span_wav
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
         )
-        if res.returncode == 0 and os.path.exists(chunk_wav):
+        if cut_res.returncode == 0 and os.path.exists(span_wav):
             try:
-                with sr.AudioFile(chunk_wav) as source:
+                with sr.AudioFile(span_wav) as source:
                     audio_data = recognizer.record(source)
                 raw_text = recognizer.recognize_google(audio_data, language="en-US")
                 cleaned = _clean_subtitle_text(raw_text)
                 if cleaned:
-                    raw_cues.extend(_build_window_cues(cleaned.split(), offset, offset + actual_len))
+                    cues.extend(_distribute_words_over_span(cleaned.split(), sp_start, sp_end))
             except sr.UnknownValueError:
                 pass
             except Exception as e:
-                logger.warning(f"Speech recognition chunk error at {offset}s: {e}")
+                logger.warning(f"Speech span transcription error ({sp_start:.2f}s-{sp_end:.2f}s): {e}")
             finally:
-                cleanup_temp_files(chunk_wav)
-        offset += step_sec
+                cleanup_temp_files(span_wav)
 
-    cues = _dedupe_and_merge_cues(raw_cues, duration_sec)
+    cleanup_temp_files(full_seg_wav)
+
     if not cues:
         logger.info("No speech transcribed for clip segment.")
         return False
@@ -485,7 +537,7 @@ def health_check():
     return {
         "status": "online",
         "service": "ClipForge AI Backend",
-        "version": "3.6.0",
+        "version": "3.7.0",
         "database": db_status,
         "timestamp_utc": datetime.utcnow().isoformat()
     }
@@ -834,7 +886,6 @@ async def upload_and_clip_endpoint(
         has_subs = generate_subtitles_srt(input_filepath, start_sec, clip_len, srt_filepath)
 
         # Full-frame 9:16 portrait letterbox with black bars on top/bottom and zero cutting.
-        # MarginV=565 raises captions by ~half a letter height from 535 while staying below the video frame.
         vf_chain = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         if has_subs and os.path.exists(srt_filepath):
             escaped_srt = _escape_ffmpeg_filter_path(srt_filepath)
